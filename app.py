@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 
-st.set_page_config(page_title="交互式绘图工具", layout="wide")
+st.set_page_config(page_title="绘图小工具-by YMX", layout="wide")
 
 # 初始化session state
 if 'charts' not in st.session_state:
