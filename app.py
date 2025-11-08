@@ -562,7 +562,7 @@ else:
 # 页脚
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: gray;'>交互式绘图工具 v1.0 | Author: yinmingxin</div>",
+    "<div style='text-align: center; color: gray;'>交互式绘图工具 v1.0 | Developer: yinmingxin</div>",
     unsafe_allow_html=True
 )
 
