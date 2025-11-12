@@ -324,7 +324,7 @@ def render_column_selector_v2(label, all_columns, default_selected, key_prefix, 
                 remaining = len(normal_columns) - visible_normal_count
                 if st.button(f"⬇️ 加载更多 ({remaining} 列未显示)", key=f"{key_prefix}_load_more_normal"):
                     st.session_state[load_count_key] += 20
-                    st.experimental_rerun()
+                    st.rerun()
             
             if list_columns:
                 st.markdown("---")
@@ -358,14 +358,14 @@ def render_column_selector_v2(label, all_columns, default_selected, key_prefix, 
                         use_container_width=True
                     ):
                         st.session_state[expand_key][list_col] = not st.session_state[expand_key].get(list_col, False)
-                        st.experimental_rerun()
+                        st.rerun()
                 
                 with col_btn1:
                     if st.button("✅", key=f"{key_prefix}_{list_col}_select_all", use_container_width=True, help="全选"):
                         # 执行全选并递增版本号，强制重新创建所有复选框
                         st.session_state[selection_key]['list_columns'][list_col] = list(range(num_channels))
                         st.session_state[version_key] += 1
-                        st.experimental_rerun()
+                        st.rerun()
                 
                 with col_btn2:
                     if st.button("🔄", key=f"{key_prefix}_{list_col}_invert", use_container_width=True, help="反选"):
@@ -374,14 +374,14 @@ def render_column_selector_v2(label, all_columns, default_selected, key_prefix, 
                         all_indices = set(range(num_channels))
                         st.session_state[selection_key]['list_columns'][list_col] = sorted(list(all_indices - current))
                         st.session_state[version_key] += 1
-                        st.experimental_rerun()
+                        st.rerun()
                 
                 with col_btn3:
                     if st.button("❌", key=f"{key_prefix}_{list_col}_clear", use_container_width=True, help="清空"):
                         # 执行清空并递增版本号，强制重新创建所有复选框
                         st.session_state[selection_key]['list_columns'][list_col] = []
                         st.session_state[version_key] += 1
-                        st.experimental_rerun()
+                        st.rerun()
                 
                 # 如果展开，显示通道选择（虚拟滚动）
                 if st.session_state[expand_key].get(list_col, False):
@@ -433,7 +433,7 @@ def render_column_selector_v2(label, all_columns, default_selected, key_prefix, 
                             key=f"{key_prefix}_{list_col}_load_more_channels"
                         ):
                             st.session_state[channel_load_key] += 20
-                            st.experimental_rerun()
+                            st.rerun()
                     
                     st.markdown('</div>', unsafe_allow_html=True)
                 
@@ -733,13 +733,13 @@ def render_chart_area(idx, chart_config, data, columns):
             edit_label = "收起属性" if st.session_state.edit_mode.get(idx, False) else "编辑属性"
             if st.button(f"⚙️ {edit_label}", key=f"edit_toggle_{idx}"):
                 st.session_state.edit_mode[idx] = not st.session_state.edit_mode.get(idx, False)
-                st.experimental_rerun()
+                st.rerun()
         with col_delete:
             if st.button("🗑️ 删除该图", key=f"delete_{idx}"):
                 st.session_state.charts.pop(idx)
                 if idx in st.session_state.edit_mode:
                     del st.session_state.edit_mode[idx]
-                st.experimental_rerun()
+                st.rerun()
         
         # 属性编辑面板（仅在编辑模式下显示）
         if st.session_state.edit_mode.get(idx, False):
@@ -853,7 +853,7 @@ def render_chart_area(idx, chart_config, data, columns):
                         'is_configured': True
                     })
                     st.success("✅ 配置已更新！")
-                    st.experimental_rerun()
+                    st.rerun()
             
             # 属性和图表之间的虚线分隔
             st.markdown('<div class="property-separator"></div>', unsafe_allow_html=True)
@@ -902,7 +902,7 @@ if st.session_state.data is not None:
         st.markdown('<div class="add-chart-container">', unsafe_allow_html=True)
         if st.button("新增绘图", key="add_first", use_container_width=True):
             add_new_chart()
-            st.experimental_rerun()
+            st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
     else:
         # 显示所有图表
@@ -916,7 +916,7 @@ if st.session_state.data is not None:
             st.markdown('<div class="add-chart-container">', unsafe_allow_html=True)
             if st.button("新增绘图", key=f"add_after_{idx}", use_container_width=True):
                 add_new_chart(position=idx)
-                st.experimental_rerun()
+                st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
     
     # 底部操作
@@ -928,7 +928,7 @@ if st.session_state.data is not None:
         if not st.session_state.confirm_clear:
             if st.button("🗑️ 清空所有图表", key="clear_all_btn", type="secondary"):
                 st.session_state.confirm_clear = True
-                st.experimental_rerun()
+                st.rerun()
         else:
             st.warning(f"⚠️ 确定要清空所有 {len(st.session_state.charts)} 个图表吗？此操作无法撤销！")
             col1, col2 = st.columns([1, 4])
@@ -937,11 +937,11 @@ if st.session_state.data is not None:
                     st.session_state.charts = []
                     st.session_state.edit_mode = {}
                     st.session_state.confirm_clear = False
-                    st.experimental_rerun()
+                    st.rerun()
             with col2:
                 if st.button("❌ 取消", key="cancel_clear_btn"):
                     st.session_state.confirm_clear = False
-                    st.experimental_rerun()
+                    st.rerun()
         
 else:
     # 未加载数据时的提示
