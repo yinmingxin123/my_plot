@@ -11,16 +11,12 @@ st.set_page_config(page_title="绘图小工具-by YMX", layout="wide")
 # 初始化session state
 if 'charts' not in st.session_state:
     st.session_state.charts = []
-if 'data' not in st.session_state:
-    st.session_state.data = None
-if 'filename' not in st.session_state:
-    st.session_state.filename = None
+if 'files_data' not in st.session_state:
+    st.session_state.files_data = {}  # {filename: {'data': DataFrame, 'list_columns_info': dict}}
 if 'edit_mode' not in st.session_state:
     st.session_state.edit_mode = {}  # 记录每个图表是否处于编辑模式
 if 'confirm_clear' not in st.session_state:
     st.session_state.confirm_clear = False  # 确认清空所有图表的状态
-if 'list_columns_info' not in st.session_state:
-    st.session_state.list_columns_info = {}  # 记录列表列信息
 if 'expanded_list_columns' not in st.session_state:
     st.session_state.expanded_list_columns = {}  # 缓存已展开的列表列数据
 if 'parsed_list_columns' not in st.session_state:
@@ -144,17 +140,26 @@ def detect_list_columns(df):
     
     return list_columns_info
 
-def expand_list_column_lazy(df, col_name, channel_indices=None):
+def expand_list_column_lazy(df, col_name, channel_indices=None, data_source=None):
     """
     按需展开列表列（高效缓存版本）
     第一次展开时解析整列并缓存为Numpy数组，后续直接从缓存中提取。
+    
+    Args:
+        df: DataFrame
+        col_name: 列名
+        channel_indices: 通道索引列表
+        data_source: 数据源文件名（用于区分不同文件中的同名列）
     """
     if col_name not in df.columns:
         return pd.DataFrame()
 
+    # 生成缓存键（包含数据源以区分不同文件）
+    cache_key = f"{data_source}_{col_name}" if data_source else col_name
+    
     # 检查是否已解析并缓存为numpy数组
-    if col_name in st.session_state.parsed_list_columns:
-        parsed_data_np = st.session_state.parsed_list_columns[col_name]
+    if cache_key in st.session_state.parsed_list_columns:
+        parsed_data_np = st.session_state.parsed_list_columns[cache_key]
         max_length = parsed_data_np.shape[1]
     else:
         # --- 昂贵的解析步骤，仅在首次需要时执行 ---
@@ -204,7 +209,7 @@ def expand_list_column_lazy(df, col_name, channel_indices=None):
                                     pass # Keep as NaN
 
             # 存入 session state 缓存
-            st.session_state.parsed_list_columns[col_name] = parsed_data_np
+            st.session_state.parsed_list_columns[cache_key] = parsed_data_np
         st.success(f"✅ 列表列 '{col_name}' 解析完成并已缓存！")
 
     # --- 从缓存中快速提取数据 ---
@@ -218,6 +223,29 @@ def expand_list_column_lazy(df, col_name, channel_indices=None):
             result_dict[channel_name] = parsed_data_np[:, i]
 
     return pd.DataFrame(result_dict)
+
+def clear_chart_states(chart_idx):
+    """
+    清理指定图表的所有相关session state
+    
+    Args:
+        chart_idx: 图表索引
+    """
+    # 清理该图表的所有相关状态（列选择、widget状态等）
+    keys_to_delete = [key for key in list(st.session_state.keys()) 
+                     if key.startswith(f'y1_{chart_idx}_') or 
+                        key.startswith(f'y2_{chart_idx}_') or
+                        key.startswith(f'x_{chart_idx}') or
+                        key.startswith(f'title_{chart_idx}') or
+                        key.startswith(f'type_{chart_idx}') or
+                        key.startswith(f'grid_{chart_idx}') or
+                        key.startswith(f'width_{chart_idx}') or
+                        key.startswith(f'height_{chart_idx}') or
+                        key.startswith(f'decimal_{chart_idx}') or
+                        key.startswith(f'data_source_{chart_idx}')]
+    for key in keys_to_delete:
+        if key in st.session_state:
+            del st.session_state[key]
 
 def load_data(uploaded_file):
     """加载CSV或Excel文件（不立即展开列表列）"""
@@ -456,7 +484,7 @@ def render_column_selector_v2(label, all_columns, default_selected, key_prefix, 
     
     return st.session_state[selection_key]
 
-def prepare_plot_data(original_df, selections, list_columns_info):
+def prepare_plot_data(original_df, selections, list_columns_info, data_source=None):
     """
     准备绘图数据（按需展开列表列）
     
@@ -464,6 +492,7 @@ def prepare_plot_data(original_df, selections, list_columns_info):
         original_df: 原始DataFrame
         selections: 选择字典 {'normal': [...], 'list_columns': {'col': [indices]}}
         list_columns_info: 列表列信息
+        data_source: 数据源文件名（用于缓存区分）
     
     Returns:
         合并后的DataFrame，包含所有需要的列
@@ -475,11 +504,11 @@ def prepare_plot_data(original_df, selections, list_columns_info):
         if not channel_indices:
             continue
             
-        # 检查缓存
-        cache_key = f"{list_col}_{'_'.join(map(str, sorted(channel_indices)))}"
+        # 检查缓存（包含数据源信息）
+        cache_key = f"{data_source}_{list_col}_{'_'.join(map(str, sorted(channel_indices)))}" if data_source else f"{list_col}_{'_'.join(map(str, sorted(channel_indices)))}"
         if cache_key not in st.session_state.expanded_list_columns:
             # 展开列表列
-            expanded_df = expand_list_column_lazy(original_df, list_col, channel_indices)
+            expanded_df = expand_list_column_lazy(original_df, list_col, channel_indices, data_source)
             st.session_state.expanded_list_columns[cache_key] = expanded_df
         else:
             expanded_df = st.session_state.expanded_list_columns[cache_key]
@@ -657,51 +686,150 @@ st.markdown("---")
 # 侧边栏：文件上传
 with st.sidebar:
     st.header("📁 数据加载")
-    uploaded_file = st.file_uploader(
-        "上传CSV或Excel文件",
+    uploaded_files = st.file_uploader(
+        "上传CSV或Excel文件（可多选）",
         type=['csv', 'xlsx', 'xls'],
-        help="选择一个数据文件，第一行应为列名"
+        help="选择一个或多个数据文件，第一行应为列名",
+        accept_multiple_files=True
     )
     
-    if uploaded_file is not None:
-        if st.session_state.filename != uploaded_file.name:
-            st.session_state.data, st.session_state.list_columns_info = load_data(uploaded_file)
-            st.session_state.filename = uploaded_file.name
-            # --- 重置所有与旧数据相关的状态 ---
+    if uploaded_files:
+        # 处理新上传的文件
+        current_filenames = {f.name for f in uploaded_files}
+        existing_filenames = set(st.session_state.files_data.keys())
+        
+        # 添加新文件
+        for uploaded_file in uploaded_files:
+            if uploaded_file.name not in existing_filenames:
+                data, list_columns_info = load_data(uploaded_file)
+                if data is not None:
+                    st.session_state.files_data[uploaded_file.name] = {
+                        'data': data,
+                        'list_columns_info': list_columns_info
+                    }
+        
+        # 删除已移除的文件
+        files_to_remove = existing_filenames - current_filenames
+        for filename in files_to_remove:
+            del st.session_state.files_data[filename]
+            
+            # 清理该文件相关的所有缓存
+            # 1. 清理解析缓存
+            keys_to_delete = [key for key in st.session_state.parsed_list_columns.keys() 
+                            if key.startswith(f"{filename}_")]
+            for key in keys_to_delete:
+                del st.session_state.parsed_list_columns[key]
+            
+            # 2. 清理展开缓存
+            keys_to_delete = [key for key in st.session_state.expanded_list_columns.keys() 
+                            if key.startswith(f"{filename}_")]
+            for key in keys_to_delete:
+                del st.session_state.expanded_list_columns[key]
+            
+            # 3. 清理使用该文件的图表配置和相关状态
+            charts_to_reset = []
+            for idx, chart in enumerate(st.session_state.charts):
+                if chart.get('data_source') == filename:
+                    charts_to_reset.append(idx)
+            
+            for idx in charts_to_reset:
+                # 重置图表配置
+                st.session_state.charts[idx]['data_source'] = None
+                st.session_state.charts[idx]['is_configured'] = False
+                st.session_state.charts[idx]['y1_columns'] = []
+                st.session_state.charts[idx]['y2_columns'] = []
+                
+                # 清理该图表的所有相关状态
+                clear_chart_states(idx)
+        
+        # 显示已加载的文件
+        if st.session_state.files_data:
+            st.success(f"✅ 已加载 {len(st.session_state.files_data)} 个文件")
+            
+            # 显示每个文件的信息
+            for filename, file_info in st.session_state.files_data.items():
+                with st.expander(f"📄 {filename}"):
+                    data = file_info['data']
+                    list_columns_info = file_info['list_columns_info']
+                    
+                    st.info(f"数据形状: {data.shape[0]} 行 × {data.shape[1]} 列")
+                    
+                    # 显示列表列信息
+                    if list_columns_info:
+                        st.markdown("**📊 列表列:**")
+                        for col_name, info in list_columns_info.items():
+                            st.write(f"- {col_name} → {info['num_channels']} 个通道")
+                    
+                    # 显示数据预览
+                    st.markdown("**📋 数据预览:**")
+                    st.dataframe(data.head(5), use_container_width=True)
+                    
+                    # 删除单个文件按钮
+                    if st.button(f"🗑️ 删除文件", key=f"delete_file_{filename}"):
+                        del st.session_state.files_data[filename]
+                        
+                        # 清理该文件相关的所有缓存
+                        # 1. 清理解析缓存
+                        keys_to_delete = [key for key in st.session_state.parsed_list_columns.keys() 
+                                        if key.startswith(f"{filename}_")]
+                        for key in keys_to_delete:
+                            del st.session_state.parsed_list_columns[key]
+                        
+                        # 2. 清理展开缓存
+                        keys_to_delete = [key for key in st.session_state.expanded_list_columns.keys() 
+                                        if key.startswith(f"{filename}_")]
+                        for key in keys_to_delete:
+                            del st.session_state.expanded_list_columns[key]
+                        
+                        # 3. 清理使用该文件的图表配置和相关状态
+                        charts_to_reset = []
+                        for idx, chart in enumerate(st.session_state.charts):
+                            if chart.get('data_source') == filename:
+                                charts_to_reset.append(idx)
+                        
+                        for idx in charts_to_reset:
+                            # 重置图表配置
+                            st.session_state.charts[idx]['data_source'] = None
+                            st.session_state.charts[idx]['is_configured'] = False
+                            st.session_state.charts[idx]['y1_columns'] = []
+                            st.session_state.charts[idx]['y2_columns'] = []
+                            
+                            # 清理该图表的所有相关状态
+                            clear_chart_states(idx)
+                        
+                        st.rerun()
+    else:
+        # 清空所有数据
+        if st.session_state.files_data:
+            # 清理所有图表的状态
+            for idx in range(len(st.session_state.charts)):
+                clear_chart_states(idx)
+            
+            st.session_state.files_data = {}
             st.session_state.charts = []
             st.session_state.edit_mode = {}
             st.session_state.expanded_list_columns = {}
             st.session_state.parsed_list_columns = {}
             st.session_state.confirm_clear = False
-            
-            # 清理所有与图表列选择相关的动态状态 (例如 y1_0_selections, y2_0_expanded 等)
-            # 这些状态的key通常以 'y1_' 或 'y2_' 开头
-            keys_to_delete = [key for key in st.session_state.keys() if key.startswith(('y1_', 'y2_'))]
-            for key in keys_to_delete:
-                del st.session_state[key]
-        
-        if st.session_state.data is not None:
-            st.success(f"✅ 已加载: {uploaded_file.name}")
-            st.info(f"数据形状: {st.session_state.data.shape[0]} 行 × {st.session_state.data.shape[1]} 列")
-            
-            # 显示列表列信息
-            if st.session_state.list_columns_info:
-                with st.expander("📊 检测到列表列"):
-                    for col_name, info in st.session_state.list_columns_info.items():
-                        st.write(f"**{col_name}** → {info['num_channels']} 个通道")
-                        st.write(f"  选择后将展开为: {col_name} #1 ~ #{info['num_channels']}")
-            
-            # 显示数据预览
-            with st.expander("📋 数据预览"):
-                st.dataframe(st.session_state.data.head(10), use_container_width=True)
 
 # 添加图表到列表的回调函数
 def add_new_chart(position=None):
     """添加新图表，position为None表示添加到末尾，否则插入到指定位置后"""
+    # 如果只有一个文件，自动选择；否则留空
+    filenames = list(st.session_state.files_data.keys())
+    default_data_source = filenames[0] if len(filenames) == 1 else None
+    
+    # 获取默认x_column
+    default_x_column = ''
+    if default_data_source:
+        data = st.session_state.files_data[default_data_source]['data']
+        default_x_column = data.columns[0] if len(data.columns) > 0 else ''
+    
     new_chart = {
         'title': f"图表 {len(st.session_state.charts) + 1}",
         'chart_type': '折线图',
-        'x_column': st.session_state.data.columns[0] if st.session_state.data is not None else '',
+        'data_source': default_data_source,  # 数据来源文件名
+        'x_column': default_x_column,
         'y1_columns': [],
         'y2_columns': [],
         'show_grid': True,
@@ -719,7 +847,7 @@ def add_new_chart(position=None):
     st.session_state.edit_mode[new_idx] = True  # 新图表默认打开编辑模式
 
 # 渲染单个图表区域
-def render_chart_area(idx, chart_config, data, columns):
+def render_chart_area(idx, chart_config):
     """渲染单个图表区域，包括属性面板和图表显示"""
     
     # 使用容器包裹整个图表区域
@@ -727,7 +855,9 @@ def render_chart_area(idx, chart_config, data, columns):
         # 标题栏和操作按钮
         col_title, col_edit, col_delete = st.columns([5, 1.5, 1.5])
         with col_title:
-            st.subheader(f"{idx + 1}. {chart_config['title']}")
+            # 显示图表标题和数据来源
+            data_source_tag = f" [{chart_config.get('data_source', '未选择')}]" if len(st.session_state.files_data) > 1 else ""
+            st.subheader(f"{idx + 1}. {chart_config['title']}{data_source_tag}")
         with col_edit:
             # 切换编辑模式
             edit_label = "收起属性" if st.session_state.edit_mode.get(idx, False) else "编辑属性"
@@ -744,6 +874,62 @@ def render_chart_area(idx, chart_config, data, columns):
         # 属性编辑面板（仅在编辑模式下显示）
         if st.session_state.edit_mode.get(idx, False):
             st.markdown("##### 📋 图表属性")
+            
+            # 如果有多个文件，显示数据源选择
+            filenames = list(st.session_state.files_data.keys())
+            if len(filenames) > 1:
+                st.markdown("**📂 数据来源**")
+                current_source = chart_config.get('data_source', None)
+                if current_source not in filenames:
+                    current_source = None
+                
+                source_index = filenames.index(current_source) if current_source else 0
+                new_data_source = st.selectbox(
+                    "选择数据文件",
+                    filenames,
+                    index=source_index,
+                    key=f"data_source_{idx}",
+                    help="选择该图表使用的数据文件"
+                )
+                
+                # 如果数据源改变，更新图表配置并重置列选择
+                if new_data_source != chart_config.get('data_source'):
+                    # 更新图表配置
+                    chart_config['data_source'] = new_data_source
+                    chart_config['y1_columns'] = []
+                    chart_config['y2_columns'] = []
+                    chart_config['y1_selections'] = {'normal': [], 'list_columns': {}}
+                    chart_config['y2_selections'] = {'normal': [], 'list_columns': {}}
+                    chart_config['y1_selected_columns'] = []
+                    chart_config['y2_selected_columns'] = []
+                    chart_config['is_configured'] = False
+                    
+                    # 重置X轴为新数据源的第一列
+                    if new_data_source and new_data_source in st.session_state.files_data:
+                        new_data = st.session_state.files_data[new_data_source]['data']
+                        chart_config['x_column'] = new_data.columns[0] if len(new_data.columns) > 0 else ''
+                    
+                    # 清理该图表的所有相关状态
+                    clear_chart_states(idx)
+                    
+                    st.warning(f"⚠️ 数据源已切换到 '{new_data_source}'，列选择已重置")
+                    st.rerun()
+            
+            # 检查是否选择了数据源
+            data_source = chart_config.get('data_source')
+            if not data_source:
+                st.error("⚠️ 请先选择数据来源！")
+                return
+            
+            # 获取对应的数据和列信息
+            if data_source not in st.session_state.files_data:
+                st.error(f"❌ 数据文件 '{data_source}' 不存在！")
+                return
+            
+            file_info = st.session_state.files_data[data_source]
+            data = file_info['data']
+            list_columns_info = file_info['list_columns_info']
+            columns = data.columns.tolist()
             
             col1, col2 = st.columns(2)
             
@@ -773,7 +959,7 @@ def render_chart_area(idx, chart_config, data, columns):
                     columns,
                     y1_default,
                     f"y1_{idx}",
-                    st.session_state.list_columns_info,
+                    list_columns_info,
                     data
                 )
             
@@ -811,7 +997,7 @@ def render_chart_area(idx, chart_config, data, columns):
                     columns,
                     y2_default,
                     f"y2_{idx}",
-                    st.session_state.list_columns_info,
+                    list_columns_info,
                     data
                 )
             
@@ -839,6 +1025,7 @@ def render_chart_area(idx, chart_config, data, columns):
                     st.session_state.charts[idx].update({
                         'title': new_title,
                         'chart_type': new_chart_type,
+                        'data_source': data_source,  # 保存数据源
                         'x_column': new_x_column,
                         'y1_columns': y1_column_names,  # 实际列名
                         'y2_columns': y2_column_names,  # 实际列名
@@ -860,7 +1047,18 @@ def render_chart_area(idx, chart_config, data, columns):
         
         # 图表显示区域
         if chart_config['is_configured'] and (chart_config.get('y1_columns') or chart_config.get('y2_columns')):
+            # 获取数据源
+            data_source = chart_config.get('data_source')
+            if not data_source or data_source not in st.session_state.files_data:
+                st.error(f"❌ 数据源 '{data_source}' 不存在！请重新配置图表。")
+                return
+            
             try:
+                # 获取对应的数据和列表列信息
+                file_info = st.session_state.files_data[data_source]
+                data = file_info['data']
+                list_columns_info = file_info['list_columns_info']
+                
                 # 准备绘图数据（按需展开列表列）
                 y1_selections = chart_config.get('y1_selections', {'normal': chart_config.get('y1_columns', []), 'list_columns': {}})
                 y2_selections = chart_config.get('y2_selections', {'normal': chart_config.get('y2_columns', []), 'list_columns': {}})
@@ -876,7 +1074,7 @@ def render_chart_area(idx, chart_config, data, columns):
                     all_selections['list_columns'][list_col] = list(set(ch1 + ch2))
                 
                 # 准备完整的数据
-                plot_data = prepare_plot_data(data, all_selections, st.session_state.list_columns_info)
+                plot_data = prepare_plot_data(data, all_selections, list_columns_info, data_source)
                 
                 # 创建图表
                 fig, config = create_plotly_chart(chart_config, plot_data)
@@ -891,10 +1089,7 @@ def render_chart_area(idx, chart_config, data, columns):
             st.info("👆 请在上方编辑属性并点击「应用修改」来绘制图表")
 
 # 主界面
-if st.session_state.data is not None:
-    data = st.session_state.data
-    columns = data.columns.tolist()
-    
+if st.session_state.files_data:
     st.header("📊 图表管理")
     
     # 如果没有图表，显示创建虚线框
@@ -907,7 +1102,7 @@ if st.session_state.data is not None:
     else:
         # 显示所有图表
         for idx, chart_config in enumerate(st.session_state.charts):
-            render_chart_area(idx, chart_config, data, columns)
+            render_chart_area(idx, chart_config)
             
             # 图表之间的实线分隔
             st.markdown('<div class="chart-separator"></div>', unsafe_allow_html=True)
@@ -953,6 +1148,7 @@ else:
     
     ### 功能特点
     - ✅ 支持CSV和Excel文件格式
+    - ✅ **多文件支持**：可同时加载多个数据文件，每个图表独立选择数据源
     - ✅ **自动解析列表列**：支持字符串形式的列表数据（如 "[2, 5, 8]"），自动展开为多个通道
     - ✅ **智能通道管理**：列表列自动分组显示，可选择性绘制指定通道
     - ✅ 交互式折线图和散点图
@@ -970,17 +1166,27 @@ else:
     - ✅ 自适应尺寸
     
     ### 操作步骤
-    1. **上传数据**: 在左侧上传数据文件（CSV或Excel）
+    1. **上传数据**: 在左侧上传一个或多个数据文件（CSV或Excel），可同时选择多个文件
     2. **创建图表**: 点击虚线框"新增绘图"按钮
-    3. **编辑属性**: 
+    3. **选择数据源**（多文件时）: 如果上传了多个文件，首先选择该图表使用的数据文件
+    4. **编辑属性**: 
        - 在属性面板中设置图表标题、类型
        - 选择X轴列
        - 在Y1轴和Y2轴框中选择要显示的列
        - 选择数值小数位数（0-6位）
        - 配置其他选项（网格、高度等）
-    4. **应用配置**: 点击「✅ 应用修改」按钮，图表将在当前区域绘制
-    5. **继续添加**: 点击图表下方的虚线框"新增绘图"创建更多图表
-    6. **修改图表**: 随时点击「⚙️ 编辑属性」重新调整，应用后在同一区域更新
+    5. **应用配置**: 点击「✅ 应用修改」按钮，图表将在当前区域绘制
+    6. **继续添加**: 点击图表下方的虚线框"新增绘图"创建更多图表
+    7. **修改图表**: 随时点击「⚙️ 编辑属性」重新调整，应用后在同一区域更新
+    
+    ### 多文件管理
+    - **上传多文件**: 在文件上传器中可同时选择多个文件，或分批添加
+    - **查看文件信息**: 左侧边栏展开每个文件可查看数据预览和列表列信息
+    - **删除单个文件**: 每个文件下方有独立的删除按钮
+    - **自动选择数据源**: 
+      - 只有1个文件时，新建图表自动选择该文件作为数据源
+      - 有多个文件时，需要手动为每个图表选择数据源
+    - **数据源显示**: 有多个文件时，图表标题后会显示数据源文件名标签
     
     ### 图表管理
     - **编辑模式**: 点击「⚙️ 编辑属性」打开面板，点击「⚙️ 收起属性」隐藏面板
@@ -1024,7 +1230,7 @@ else:
 # 页脚
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: gray;'>交互式绘图工具 v1.0 | Developer: yinmingxin</div>",
+    "<div style='text-align: center; color: gray;'>交互式绘图工具 v2.0 (多文件支持) | Developer: yinmingxin</div>",
     unsafe_allow_html=True
 )
 
