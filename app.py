@@ -8,11 +8,15 @@ import numpy as np
 
 st.set_page_config(page_title="绘图小工具-by YMX", layout="wide")
 
+# 大文件阈值配置
+LARGE_FILE_THRESHOLD = 500000  # 超过50万行视为大文件
+DOWNSAMPLE_TARGET_POINTS = 10000  # 降采样目标点数
+
 # 初始化session state
 if 'charts' not in st.session_state:
     st.session_state.charts = []
 if 'files_data' not in st.session_state:
-    st.session_state.files_data = {}  # {filename: {'data': DataFrame, 'list_columns_info': dict}}
+    st.session_state.files_data = {}  # {filename: {'data': DataFrame, 'list_columns_info': dict, 'is_large': bool, 'downsampled': DataFrame}}
 if 'edit_mode' not in st.session_state:
     st.session_state.edit_mode = {}  # 记录每个图表是否处于编辑模式
 if 'confirm_clear' not in st.session_state:
@@ -21,6 +25,446 @@ if 'expanded_list_columns' not in st.session_state:
     st.session_state.expanded_list_columns = {}  # 缓存已展开的列表列数据
 if 'parsed_list_columns' not in st.session_state:
     st.session_state.parsed_list_columns = {} # 缓存已解析的列表列
+if 'chart_range_mode' not in st.session_state:
+    st.session_state.chart_range_mode = {}  # 记录每个图表的显示模式：'downsampled' 或 'original'
+if 'chart_range_selection' not in st.session_state:
+    st.session_state.chart_range_selection = {}  # 记录每个图表的范围选择（输入框当前值）
+if 'confirmed_chart_range' not in st.session_state:
+    st.session_state.confirmed_chart_range = {}  # 记录已确认绘制的范围（点击绘制按钮后才更新）
+if 'chart_data_ready' not in st.session_state:
+    st.session_state.chart_data_ready = {}  # 记录原始数据模式下是否已确认绘制
+if 'downsample_ratio' not in st.session_state:
+    st.session_state.downsample_ratio = 100  # 默认降采样倍数
+
+# Fragment 函数：原始数据模式的范围选择输入控件
+# 使用 @st.fragment 使输入变化时只刷新输入部分，不影响图表
+@st.fragment
+def render_range_input_controls(idx: int, total_rows: int, downsampled_rows: int, x_col: str, original_data):
+    """渲染范围选择输入控件（三向联动）- 作为 fragment，修改时不触发整个页面刷新"""
+    """渲染范围选择输入控件（三向联动）"""
+    
+    # 初始化session_state中的联动值（如果不存在）
+    if f'ds_start_{idx}' not in st.session_state:
+        # 获取当前范围（原始数据行号）
+        current_range = st.session_state.chart_range_selection.get(idx)
+        if current_range:
+            is_numeric_x = pd.api.types.is_numeric_dtype(original_data[x_col])
+            if is_numeric_x:
+                # 数值型X轴，current_range是X轴值，需要转换为行号
+                x_min = float(original_data[x_col].min())
+                x_max = float(original_data[x_col].max())
+                x_range = x_max - x_min
+                if x_range > 0:
+                    default_start_pct = ((float(current_range[0]) - x_min) / x_range * 100)
+                    default_end_pct = ((float(current_range[1]) - x_min) / x_range * 100)
+                    default_start_row = int(default_start_pct / 100 * total_rows)
+                    default_end_row = int(default_end_pct / 100 * total_rows)
+                else:
+                    default_start_pct = 40.0
+                    default_end_pct = 60.0
+                    default_start_row = int(total_rows * 0.4)
+                    default_end_row = int(total_rows * 0.6)
+            else:
+                # 非数值型X轴，current_range就是行号
+                default_start_row = int(current_range[0])
+                default_end_row = int(current_range[1])
+                default_start_pct = (default_start_row / total_rows * 100) if total_rows > 0 else 40.0
+                default_end_pct = (default_end_row / total_rows * 100) if total_rows > 0 else 60.0
+        else:
+            # 没有当前范围，使用中间20%
+            default_start_pct = 40.0
+            default_end_pct = 60.0
+            default_start_row = int(total_rows * 0.4)
+            default_end_row = int(total_rows * 0.6)
+        
+        # 计算对应的降采样图行号
+        default_start_ds_row = int(default_start_pct / 100 * downsampled_rows)
+        default_end_ds_row = int(default_end_pct / 100 * downsampled_rows)
+        
+        # 初始化session_state
+        st.session_state[f'ds_start_{idx}'] = default_start_ds_row
+        st.session_state[f'ds_end_{idx}'] = default_end_ds_row
+        st.session_state[f'pct_start_{idx}'] = default_start_pct
+        st.session_state[f'pct_end_{idx}'] = default_end_pct
+        st.session_state[f'row_start_{idx}'] = default_start_row
+        st.session_state[f'row_end_{idx}'] = default_end_row
+    
+    # 定义联动回调函数
+    def update_from_ds_start():
+        ds_val = st.session_state[f'ds_start_{idx}']
+        pct_val = (ds_val / downsampled_rows * 100) if downsampled_rows > 0 else 0
+        row_val = int(pct_val / 100 * total_rows)
+        st.session_state[f'pct_start_{idx}'] = pct_val
+        st.session_state[f'row_start_{idx}'] = row_val
+    
+    def update_from_ds_end():
+        ds_val = st.session_state[f'ds_end_{idx}']
+        pct_val = (ds_val / downsampled_rows * 100) if downsampled_rows > 0 else 0
+        row_val = int(pct_val / 100 * total_rows)
+        st.session_state[f'pct_end_{idx}'] = pct_val
+        st.session_state[f'row_end_{idx}'] = row_val
+    
+    def update_from_pct_start():
+        pct_val = st.session_state[f'pct_start_{idx}']
+        ds_val = int(pct_val / 100 * downsampled_rows)
+        row_val = int(pct_val / 100 * total_rows)
+        st.session_state[f'ds_start_{idx}'] = ds_val
+        st.session_state[f'row_start_{idx}'] = row_val
+    
+    def update_from_pct_end():
+        pct_val = st.session_state[f'pct_end_{idx}']
+        ds_val = int(pct_val / 100 * downsampled_rows)
+        row_val = int(pct_val / 100 * total_rows)
+        st.session_state[f'ds_end_{idx}'] = ds_val
+        st.session_state[f'row_end_{idx}'] = row_val
+    
+    def update_from_row_start():
+        row_val = st.session_state[f'row_start_{idx}']
+        pct_val = (row_val / total_rows * 100) if total_rows > 0 else 0
+        ds_val = int(pct_val / 100 * downsampled_rows)
+        st.session_state[f'pct_start_{idx}'] = pct_val
+        st.session_state[f'ds_start_{idx}'] = ds_val
+    
+    def update_from_row_end():
+        row_val = st.session_state[f'row_end_{idx}']
+        pct_val = (row_val / total_rows * 100) if total_rows > 0 else 0
+        ds_val = int(pct_val / 100 * downsampled_rows)
+        st.session_state[f'pct_end_{idx}'] = pct_val
+        st.session_state[f'ds_end_{idx}'] = ds_val
+    
+    # 1️⃣ 降采样图行号输入（带自动联动）
+    st.markdown("**1️⃣ 降采样图行号（从hover中读取）**")
+    ds_col1, ds_col2 = st.columns(2)
+    with ds_col1:
+        st.number_input(
+            f"起始行号 (降采样图: 0-{downsampled_rows-1})",
+            min_value=0,
+            max_value=downsampled_rows - 1,
+            step=1,
+            key=f'ds_start_{idx}',
+            on_change=update_from_ds_start,
+            help=f"从降采样图hover中看到的行索引（0到{downsampled_rows-1}）"
+        )
+    with ds_col2:
+        st.number_input(
+            f"结束行号 (降采样图: 0-{downsampled_rows-1})",
+            min_value=0,
+            max_value=downsampled_rows - 1,
+            step=1,
+            key=f'ds_end_{idx}',
+            on_change=update_from_ds_end,
+            help=f"从降采样图hover中看到的行索引（0到{downsampled_rows-1}）"
+        )
+    
+    # 2️⃣ 百分比输入（带自动联动，精确到4位小数）
+    st.markdown("**2️⃣ 百分比**")
+    pct_col1, pct_col2 = st.columns(2)
+    with pct_col1:
+        st.number_input(
+            "起始百分比 (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=0.0001,
+            format="%.4f",
+            key=f'pct_start_{idx}',
+            on_change=update_from_pct_start,
+            help="数据起始位置的百分比（0-100%），精确到0.0001%"
+        )
+    with pct_col2:
+        st.number_input(
+            "结束百分比 (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=0.0001,
+            format="%.4f",
+            key=f'pct_end_{idx}',
+            on_change=update_from_pct_end,
+            help="数据结束位置的百分比（0-100%），精确到0.0001%"
+        )
+    
+    # 3️⃣ 原始数据行号输入（带自动联动）
+    st.markdown("**3️⃣ 原始数据行号**")
+    row_col1, row_col2 = st.columns(2)
+    with row_col1:
+        st.number_input(
+            f"起始行号 (原始数据: 0-{total_rows-1})",
+            min_value=0,
+            max_value=total_rows - 1,
+            step=1000,
+            key=f'row_start_{idx}',
+            on_change=update_from_row_start,
+            help=f"原始数据的起始行号（0到{total_rows-1}）"
+        )
+    with row_col2:
+        st.number_input(
+            f"结束行号 (原始数据: 0-{total_rows-1})",
+            min_value=0,
+            max_value=total_rows - 1,
+            step=1000,
+            key=f'row_end_{idx}',
+            on_change=update_from_row_end,
+            help=f"原始数据的结束行号（0到{total_rows-1}）"
+        )
+    
+    # 数值验证和显示
+    current_ds_start = st.session_state[f'ds_start_{idx}']
+    current_ds_end = st.session_state[f'ds_end_{idx}']
+    current_pct_start = st.session_state[f'pct_start_{idx}']
+    current_pct_end = st.session_state[f'pct_end_{idx}']
+    current_row_start = st.session_state[f'row_start_{idx}']
+    current_row_end = st.session_state[f'row_end_{idx}']
+    
+    # 校验：起始必须小于等于结束
+    has_error = False
+    if current_ds_start > current_ds_end or current_pct_start > current_pct_end or current_row_start > current_row_end:
+        st.error("❌ 起始索引不能大于结束索引")
+        has_error = True
+    
+    if not has_error:
+        # 更新chart_range_selection
+        st.session_state.chart_range_selection[idx] = (current_row_start, current_row_end)
+        
+        # 计算并显示范围内的数据量
+        range_data_count = current_row_end - current_row_start + 1
+        range_percentage = (range_data_count / total_rows) * 100
+        st.caption(f"📊 选定范围内数据量: {range_data_count:,} 行 ({range_percentage:.2f}%)")
+        
+        # 数据量警告
+        if range_data_count > 1000000:
+            st.warning(f"⚠️ 选定范围内数据量较大 ({range_data_count:,} 行)，绘图可能需要较长时间。建议缩小范围。")
+        elif range_data_count > 500000:
+            st.warning(f"⚠️ 选定范围内数据量较多 ({range_data_count:,} 行)，绘图可能需要数秒时间")
+
+# Fragment 函数：图表属性编辑面板
+# 使用 @st.fragment 使属性修改时只刷新属性面板，不影响图表绘制区
+@st.fragment
+def render_chart_properties_fragment(idx: int, chart_config: dict):
+    """渲染图表属性编辑面板 - 作为 fragment，修改属性时不触发整个页面刷新"""
+    
+    st.markdown("##### 📋 图表属性")
+    
+    # 获取文件列表
+    filenames = list(st.session_state.files_data.keys())
+    
+    # 如果有多个文件，显示数据源选择
+    if len(filenames) > 1:
+        st.markdown("**📂 数据来源**")
+        current_source = chart_config.get('data_source', None)
+        if current_source not in filenames:
+            current_source = None
+        
+        source_index = filenames.index(current_source) if current_source else 0
+        new_data_source = st.selectbox(
+            "选择数据文件",
+            filenames,
+            index=source_index,
+            key=f"data_source_{idx}",
+            help="选择该图表使用的数据文件"
+        )
+        
+        # 如果数据源改变，更新图表配置并重置列选择
+        if new_data_source != chart_config.get('data_source'):
+            # 更新图表配置
+            chart_config['data_source'] = new_data_source
+            chart_config['y1_columns'] = []
+            chart_config['y2_columns'] = []
+            chart_config['y1_selections'] = {'normal': [], 'list_columns': {}}
+            chart_config['y2_selections'] = {'normal': [], 'list_columns': {}}
+            chart_config['y1_selected_columns'] = []
+            chart_config['y2_selected_columns'] = []
+            chart_config['is_configured'] = False
+            
+            # 重置X轴为新数据源的第一列
+            if new_data_source and new_data_source in st.session_state.files_data:
+                new_data = st.session_state.files_data[new_data_source]['data']
+                chart_config['x_column'] = new_data.columns[0] if len(new_data.columns) > 0 else ''
+            
+            # 清理该图表的所有相关状态
+            clear_chart_states(idx)
+            
+            st.warning(f"⚠️ 数据源已切换到 '{new_data_source}'，列选择已重置")
+            st.rerun(scope="app")  # 数据源改变需要刷新整个页面
+    
+    # 检查是否选择了数据源
+    data_source = chart_config.get('data_source')
+    if not data_source:
+        st.error("⚠️ 请先选择数据来源！")
+        return
+    
+    # 获取对应的数据和列信息
+    if data_source not in st.session_state.files_data:
+        st.error(f"❌ 数据文件 '{data_source}' 不存在！")
+        return
+    
+    file_info = st.session_state.files_data[data_source]
+    data = file_info['data']
+    list_columns_info = file_info['list_columns_info']
+    columns = data.columns.tolist()
+    
+    # 重叠模式开关（显著标识）
+    st.markdown("---")
+    st.markdown("### 🎨 绘图模式")
+    overlay_mode = st.checkbox(
+        "🔄 启用重叠模式（多特征共享X轴，每个特征独立Y轴）",
+        value=chart_config.get('overlay_mode', False),
+        key=f"overlay_mode_{idx}",
+        help="启用后，所有选中的特征将绘制在同一图表中，每个特征使用独立的Y轴刻度，并通过颜色关联。适合量纲差异大的多特征对比。"
+    )
+    
+    if overlay_mode:
+        st.info("💡 重叠模式已启用：所有Y轴特征将使用独立刻度，通过颜色强关联（曲线、Y轴、图例同色）")
+        
+        # 重叠模式下的轴排布策略
+        axis_placement = st.radio(
+            "Y轴排布策略",
+            options=['alternate', 'left'],
+            format_func=lambda x: '左右交替' if x == 'alternate' else '左侧堆叠',
+            index=0 if chart_config.get('axis_placement', 'alternate') == 'alternate' else 1,
+            key=f"axis_placement_{idx}",
+            horizontal=True,
+            help="左右交替：Y轴在左右两侧交替排列；左侧堆叠：所有Y轴在左侧堆叠排列"
+        )
+    else:
+        axis_placement = 'alternate'
+    
+    st.markdown("---")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        new_title = st.text_input(
+            "图表标题", 
+            value=chart_config['title'],
+            key=f"title_{idx}",
+            help="双击图表可快速修改标题"
+        )
+        new_chart_type = st.selectbox(
+            "图表类型", 
+            ['折线图', '散点图'],
+            index=['折线图', '散点图'].index(chart_config['chart_type']),
+            key=f"type_{idx}"
+        )
+        new_x_column = st.selectbox(
+            "X轴 (横坐标)", 
+            columns,
+            index=columns.index(chart_config['x_column']) if chart_config['x_column'] in columns else 0,
+            key=f"x_{idx}"
+        )
+        
+        # 根据模式显示不同的Y轴选择器
+        if overlay_mode:
+            # 重叠模式：不区分Y1/Y2，统一选择
+            y1_default = chart_config.get('y1_selected_columns', [])
+            y1_selections = render_column_selector_v2(
+                "Y轴特征（每个特征独立刻度）",
+                columns,
+                y1_default,
+                f"y1_{idx}",
+                list_columns_info,
+                data
+            )
+            # 重叠模式下Y2为空
+            y2_selections = {'normal': [], 'list_columns': {}}
+        else:
+            # 普通模式：区分Y1/Y2
+            y1_default = chart_config.get('y1_selected_columns', [])
+            y1_selections = render_column_selector_v2(
+                "Y1轴 (左侧纵坐标)",
+                columns,
+                y1_default,
+                f"y1_{idx}",
+                list_columns_info,
+                data
+            )
+    
+    with col2:
+        new_width = st.slider(
+            "图表宽度 (像素)", 
+            600, 2000, 
+            chart_config.get('width', 1200), 
+            50,
+            key=f"width_{idx}"
+        )
+        new_height = st.slider(
+            "图表高度 (像素)", 
+            300, 800, 
+            chart_config['height'], 
+            50,
+            key=f"height_{idx}"
+        )
+        new_show_grid = st.checkbox(
+            "显示网格", 
+            value=chart_config['show_grid'],
+            key=f"grid_{idx}"
+        )
+        new_decimal_places = st.selectbox(
+            "数值小数位数",
+            options=[0, 1, 2, 3, 4, 5, 6],
+            index=chart_config['decimal_places'],
+            help="控制悬浮框和坐标轴刻度显示的小数位数",
+            key=f"decimal_{idx}"
+        )
+        
+        # 普通模式下显示Y2轴选择器
+        if not overlay_mode:
+            y2_default = chart_config.get('y2_selected_columns', [])
+            y2_selections = render_column_selector_v2(
+                "Y2轴 (右侧纵坐标)",
+                columns,
+                y2_default,
+                f"y2_{idx}",
+                list_columns_info,
+                data
+            )
+    
+    # 应用按钮
+    if st.button("✅ 应用修改", key=f"apply_{idx}", type="primary"):
+        # 检查是否有选中列
+        y1_total = len(y1_selections['normal']) + sum(len(chs) for chs in y1_selections['list_columns'].values())
+        y2_total = len(y2_selections['normal']) + sum(len(chs) for chs in y2_selections['list_columns'].values())
+        
+        if y1_total == 0 and y2_total == 0:
+            st.error("请至少选择一个Y轴特征！")
+        else:
+            # 生成实际的列名列表（用于绘图）
+            y1_column_names = y1_selections['normal'].copy()
+            for list_col, channel_indices in y1_selections['list_columns'].items():
+                for ch_idx in channel_indices:
+                    y1_column_names.append(f"{list_col} #{ch_idx+1}")
+            
+            y2_column_names = y2_selections['normal'].copy()
+            for list_col, channel_indices in y2_selections['list_columns'].items():
+                for ch_idx in channel_indices:
+                    y2_column_names.append(f"{list_col} #{ch_idx+1}")
+            
+            # 重叠模式特殊提示
+            if overlay_mode:
+                total_features = y1_total
+                if total_features > 10:
+                    st.warning(f"⚠️ 当前选择了 {total_features} 个特征，建议不超过10个以保持图表清晰度。")
+            
+            # 更新图表配置
+            st.session_state.charts[idx].update({
+                'title': new_title,
+                'chart_type': new_chart_type,
+                'data_source': data_source,  # 保存数据源
+                'x_column': new_x_column,
+                'y1_columns': y1_column_names,  # 实际列名
+                'y2_columns': y2_column_names,  # 实际列名
+                'y1_selections': y1_selections,  # 保存选择状态
+                'y2_selections': y2_selections,  # 保存选择状态
+                'y1_selected_columns': y1_column_names,  # 用于下次打开时回显
+                'y2_selected_columns': y2_column_names,
+                'show_grid': new_show_grid,
+                'width': new_width,
+                'height': new_height,
+                'decimal_places': new_decimal_places,
+                'overlay_mode': overlay_mode,  # 保存重叠模式
+                'axis_placement': axis_placement,  # 保存轴排布策略
+                'is_configured': True
+            })
+            st.success("✅ 配置已更新！")
+            st.rerun(scope="app")  # 使用 scope="app" 刷新整个页面来更新图表
 
 # CSS样式
 st.markdown("""
@@ -95,6 +539,156 @@ st.markdown("""
 
 </style>
 """, unsafe_allow_html=True)
+
+def lttb_downsample(data, x_col, y_cols, threshold):
+    """
+    使用LTTB算法对数据进行降采样，保留数据特征
+    
+    Args:
+        data: DataFrame，原始数据
+        x_col: X轴列名
+        y_cols: Y轴列名列表
+        threshold: 目标点数
+    
+    Returns:
+        降采样后的DataFrame
+    """
+    if len(data) <= threshold:
+        return data.copy()
+    
+    # 检查X轴是否为数值类型
+    if x_col not in data.columns:
+        return simple_downsample(data, threshold)
+    
+    if not pd.api.types.is_numeric_dtype(data[x_col]):
+        # X轴不是数值类型，回退到简单降采样
+        return simple_downsample(data, threshold)
+    
+    # 对每个y列分别进行LTTB降采样，然后合并索引
+    all_indices = set()
+    
+    for y_col in y_cols:
+        if y_col not in data.columns:
+            continue
+        
+        # 检查Y轴是否为数值类型
+        if not pd.api.types.is_numeric_dtype(data[y_col]):
+            continue
+        
+        # 提取x和y数据，移除NaN
+        temp_df = data[[x_col, y_col]].dropna()
+        if len(temp_df) <= threshold:
+            all_indices.update(temp_df.index)
+            continue
+        
+        # 确保数据是数值类型
+        try:
+            x_data = temp_df[x_col].astype(float).values
+            y_data = temp_df[y_col].astype(float).values
+        except (ValueError, TypeError):
+            # 无法转换为浮点数，跳过该列
+            continue
+        
+        # LTTB算法
+        try:
+            sampled_indices = []
+            bucket_size = (len(temp_df) - 2) / (threshold - 2)
+            
+            # 始终包含第一个点
+            sampled_indices.append(0)
+            
+            a = 0  # 上一个选中的点
+            for i in range(threshold - 2):
+                # 当前桶的范围
+                avg_range_start = int(np.floor((i + 1) * bucket_size) + 1)
+                avg_range_end = int(np.floor((i + 2) * bucket_size) + 1)
+                avg_range_end = min(avg_range_end, len(temp_df))
+                
+                # 防止空切片
+                if avg_range_start >= avg_range_end:
+                    continue
+                
+                # 计算下一个桶的平均点
+                avg_x = float(np.mean(x_data[avg_range_start:avg_range_end]))
+                avg_y = float(np.mean(y_data[avg_range_start:avg_range_end]))
+                
+                # 在当前桶中找到形成最大三角形面积的点
+                range_offs = int(np.floor((i + 0) * bucket_size) + 1)
+                range_to = int(np.floor((i + 1) * bucket_size) + 1)
+                
+                # 防止越界
+                range_offs = min(range_offs, len(temp_df) - 1)
+                range_to = min(range_to, len(temp_df))
+                
+                if range_offs >= range_to:
+                    continue
+                
+                point_a_x = float(x_data[a])
+                point_a_y = float(y_data[a])
+                
+                max_area = -1
+                next_a = range_offs
+                
+                for idx in range(range_offs, range_to):
+                    # 计算三角形面积
+                    area = abs(
+                        (point_a_x - avg_x) * (float(y_data[idx]) - point_a_y) -
+                        (point_a_x - float(x_data[idx])) * (avg_y - point_a_y)
+                    ) * 0.5
+                    
+                    if area > max_area:
+                        max_area = area
+                        next_a = idx
+                
+                sampled_indices.append(next_a)
+                a = next_a
+            
+            # 始终包含最后一个点
+            sampled_indices.append(len(temp_df) - 1)
+            
+            # 将局部索引转换为原始DataFrame索引
+            original_indices = temp_df.iloc[sampled_indices].index
+            all_indices.update(original_indices)
+        except Exception as e:
+            # LTTB算法失败，使用该列的所有索引
+            all_indices.update(temp_df.index)
+    
+    # 合并所有y列的采样点，去重并排序
+    if len(all_indices) == 0:
+        # 如果LTTB没有采样到任何点，回退到简单降采样
+        return simple_downsample(data, threshold)
+    
+    selected_indices = sorted(list(all_indices))
+    
+    # 如果采样点太少，补充一些点
+    if len(selected_indices) < threshold // 2:
+        return simple_downsample(data, threshold)
+    
+    return data.loc[selected_indices].reset_index(drop=True)
+
+def simple_downsample(data, threshold):
+    """
+    简单的均匀降采样
+    
+    Args:
+        data: DataFrame，原始数据
+        threshold: 目标点数
+    
+    Returns:
+        降采样后的DataFrame
+    """
+    if len(data) <= threshold:
+        return data.copy()
+    
+    # 均匀采样
+    step = len(data) // threshold
+    indices = list(range(0, len(data), step))
+    
+    # 确保包含最后一个点
+    if indices[-1] != len(data) - 1:
+        indices.append(len(data) - 1)
+    
+    return data.iloc[indices].reset_index(drop=True)
 
 def parse_list_string(s):
     """尝试将字符串解析为列表"""
@@ -247,7 +841,7 @@ def clear_chart_states(chart_idx):
         if key in st.session_state:
             del st.session_state[key]
 
-def load_data(uploaded_file):
+def load_data(uploaded_file, downsample_ratio=100):
     """加载CSV或Excel文件（不立即展开列表列）"""
     try:
         if uploaded_file.name.endswith('.csv'):
@@ -256,15 +850,26 @@ def load_data(uploaded_file):
             df = pd.read_excel(uploaded_file)
         else:
             st.error("不支持的文件格式，请上传CSV或Excel文件")
-            return None, None
+            return None, None, False, None
         
         # 只检测列表列，不展开
         list_columns_info = detect_list_columns(df)
         
-        return df, list_columns_info
+        # 检查是否为大文件
+        is_large = len(df) > LARGE_FILE_THRESHOLD
+        
+        # 如果是大文件，生成降采样版本（使用简单降采样，因为还不知道要画哪些列）
+        downsampled_df = None
+        if is_large:
+            target_points = max(1000, len(df) // downsample_ratio)  # 根据倍数计算目标点数，最少1000点
+            with st.spinner(f"⏳ 检测到大文件 ({len(df):,} 行)，正在生成预览数据（{downsample_ratio}倍降采样到约{target_points:,}点）..."):
+                downsampled_df = simple_downsample(df, target_points)
+            st.success(f"✅ 预览数据已生成 ({len(downsampled_df):,} 点)")
+        
+        return df, list_columns_info, is_large, downsampled_df
     except Exception as e:
         st.error(f"读取文件出错: {str(e)}")
-        return None, None
+        return None, None, False, None
 
 def render_column_selector_v2(label, all_columns, default_selected, key_prefix, list_columns_info, original_df):
     """
@@ -484,20 +1089,50 @@ def render_column_selector_v2(label, all_columns, default_selected, key_prefix, 
     
     return st.session_state[selection_key]
 
-def prepare_plot_data(original_df, selections, list_columns_info, data_source=None):
+def prepare_plot_data(original_df, selections, list_columns_info, data_source=None, 
+                      use_downsample=False, x_column=None, y_columns=None,
+                      range_start=None, range_end=None, use_index_range=False, downsample_ratio=100):
     """
-    准备绘图数据（按需展开列表列）
+    准备绘图数据（按需展开列表列，支持降采样和范围过滤）
     
     Args:
         original_df: 原始DataFrame
         selections: 选择字典 {'normal': [...], 'list_columns': {'col': [indices]}}
         list_columns_info: 列表列信息
         data_source: 数据源文件名（用于缓存区分）
+        use_downsample: 是否使用降采样
+        x_column: X轴列名（用于LTTB降采样）
+        y_columns: Y轴列名列表（用于LTTB降采样）
+        range_start: 范围起始值（基于x_column的值或行索引）
+        range_end: 范围结束值（基于x_column的值或行索引）
+        use_index_range: 是否使用行索引范围（当X轴非数值型时）
     
     Returns:
-        合并后的DataFrame，包含所有需要的列
+        tuple: (合并后的DataFrame，原始索引列表)
     """
-    result_df = original_df.copy()
+    # 如果指定了范围，先进行范围过滤
+    if range_start is not None and range_end is not None:
+        if use_index_range:
+            # 使用行索引范围
+            range_start = int(range_start)
+            range_end = int(range_end)
+            if range_start >= 0 and range_end < len(original_df) and range_start <= range_end:
+                result_df = original_df.iloc[range_start:range_end + 1].copy()
+                original_indices = list(range(range_start, range_end + 1))
+            else:
+                result_df = original_df.copy()
+                original_indices = list(range(len(original_df)))
+        elif x_column is not None and x_column in original_df.columns:
+            # 使用X轴值范围（数值型X轴）
+            mask = (original_df[x_column] >= range_start) & (original_df[x_column] <= range_end)
+            result_df = original_df[mask].copy()
+            original_indices = original_df[mask].index.tolist()
+        else:
+            result_df = original_df.copy()
+            original_indices = list(range(len(original_df)))
+    else:
+        result_df = original_df.copy()
+        original_indices = list(range(len(original_df)))
     
     # 按需展开选中的列表列通道
     for list_col, channel_indices in selections.get('list_columns', {}).items():
@@ -508,18 +1143,344 @@ def prepare_plot_data(original_df, selections, list_columns_info, data_source=No
         cache_key = f"{data_source}_{list_col}_{'_'.join(map(str, sorted(channel_indices)))}" if data_source else f"{list_col}_{'_'.join(map(str, sorted(channel_indices)))}"
         if cache_key not in st.session_state.expanded_list_columns:
             # 展开列表列
-            expanded_df = expand_list_column_lazy(original_df, list_col, channel_indices, data_source)
+            expanded_df = expand_list_column_lazy(result_df, list_col, channel_indices, data_source)
             st.session_state.expanded_list_columns[cache_key] = expanded_df
         else:
             expanded_df = st.session_state.expanded_list_columns[cache_key]
+            # 如果进行了范围过滤，需要重新提取对应行
+            if range_start is not None and range_end is not None:
+                expanded_df = expand_list_column_lazy(result_df, list_col, channel_indices, data_source)
         
         # 合并到结果DataFrame
         for col in expanded_df.columns:
             result_df[col] = expanded_df[col]
     
-    return result_df
+    # 如果使用降采样且数据量大（并且没有指定范围）
+    target_points = max(1000, len(result_df) // downsample_ratio)  # 根据倍数计算目标点数
+    if use_downsample and len(result_df) > target_points and range_start is None and range_end is None:
+        if x_column and y_columns:
+            # 检查X轴是否为数值类型
+            if x_column in result_df.columns and pd.api.types.is_numeric_dtype(result_df[x_column]):
+                # 使用LTTB算法降采样
+                result_df = lttb_downsample(result_df, x_column, y_columns, target_points)
+                # 更新原始索引以匹配降采样后的数据
+                original_indices = result_df.index.tolist()
+            else:
+                # X轴不是数值类型，使用简单降采样
+                result_df = simple_downsample(result_df, target_points)
+                # 更新原始索引以匹配降采样后的数据
+                original_indices = result_df.index.tolist()
+    
+    return result_df, original_indices
 
-def create_plotly_chart(chart_config, data):
+def create_plotly_chart_overlay(chart_config, data, original_indices=None):
+    """创建重叠模式的Plotly图表 - 多条曲线，每条独立Y轴"""
+    
+    # 获取所有Y列（不区分Y1和Y2）
+    all_y_columns = chart_config.get('y1_columns', []) + chart_config.get('y2_columns', [])
+    
+    if len(all_y_columns) == 0:
+        # 没有Y列，返回空图
+        return go.Figure(), {}
+    
+    # 获取配置
+    decimal_places = chart_config.get('decimal_places', 4)
+    if decimal_places == 0:
+        hover_format = ':.0f'
+        tick_format = ',.0f'
+    else:
+        hover_format = f':.{decimal_places}f'
+        tick_format = f',.{decimal_places}f'
+    
+    # 准备行索引数据
+    if original_indices is not None:
+        row_indices = original_indices
+    else:
+        row_indices = data.index.tolist()
+    
+    # 定义高辨识度的颜色序列（最多支持10条曲线）
+    color_palette = [
+        '#E74C3C',  # 红色
+        '#3498DB',  # 蓝色
+        '#2ECC71',  # 绿色
+        '#F39C12',  # 橙色
+        '#9B59B6',  # 紫色
+        '#1ABC9C',  # 青色
+        '#E67E22',  # 深橙
+        '#34495E',  # 深灰蓝
+        '#E91E63',  # 粉红
+        '#00BCD4',  # 天蓝
+    ]
+    
+    # 创建图表
+    fig = go.Figure()
+    
+    # Y轴布局策略配置
+    axis_placement = chart_config.get('axis_placement', 'alternate')  # 'alternate'(左右交替) 或 'left'(左侧堆叠)
+    tick_font_size = 9  # 刻度字号
+    
+    # 自适应轴间距：根据刻度数字最长位数计算
+    # 一次性筛选出所有数值型Y列，向量化计算最大绝对值
+    numeric_y_cols = [col for col in all_y_columns if col in data.columns and pd.api.types.is_numeric_dtype(data[col])]
+    if numeric_y_cols:
+        # pandas 向量化操作：一次性计算所有列的绝对值最大值
+        max_abs_value = data[numeric_y_cols].abs().max().max()
+        if pd.isna(max_abs_value):
+            max_abs_value = 0
+    else:
+        max_abs_value = 0
+    
+    # 计算整数位数
+    if max_abs_value > 0:
+        import math
+        int_digits = int(math.floor(math.log10(max_abs_value))) + 1
+    else:
+        int_digits = 1
+    
+    # 总位数 = 整数位数 + 1(小数点) + 小数位数
+    total_digits = int_digits + 1 + decimal_places
+    
+    # 轴间距 = 位数 * 系数（每位约0.004的宽度）
+    axis_offset = total_digits * 0.004 + 0.01  # 基础间距 + 位数相关间距
+    
+    # 添加每条曲线和对应的Y轴
+    for idx, y_col in enumerate(all_y_columns):
+        if y_col not in data.columns:
+            continue
+        
+        # 分配颜色
+        color = color_palette[idx % len(color_palette)]
+        
+        # 确定Y轴名称和位置
+        if idx == 0:
+            yaxis_name = 'y'
+            yaxis_ref = 'y'
+        else:
+            yaxis_name = f'y{idx + 1}'
+            yaxis_ref = f'y{idx + 1}'
+        
+        # 准备数据
+        x_data = data[chart_config['x_column']]
+        y_data = data[y_col]
+        
+        # 检测数据类型
+        is_numeric = pd.api.types.is_numeric_dtype(y_data)
+        if is_numeric:
+            y_hover = f'%{{y{hover_format}}}'
+        else:
+            y_hover = '%{y}'
+        
+        # Hover模板（只在第一条曲线显示行索引）
+        if idx == 0:
+            hover_template = f'<b>{y_col}</b>: {y_hover} (行索引: %{{customdata}})<extra></extra>'
+        else:
+            hover_template = f'<b>{y_col}</b>: {y_hover}<extra></extra>'
+        
+        # 添加曲线
+        if chart_config['chart_type'] == '折线图':
+            trace = go.Scatter(
+                x=x_data,
+                y=y_data,
+                mode='lines',
+                name=y_col,
+                yaxis=yaxis_ref,
+                line=dict(color=color, width=2),
+                customdata=row_indices,
+                hovertemplate=hover_template,
+                legendgroup=y_col,
+            )
+        else:  # 散点图
+            trace = go.Scattergl(
+                x=x_data,
+                y=y_data,
+                mode='markers',
+                name=y_col,
+                yaxis=yaxis_ref,
+                marker=dict(color=color, size=5),
+                customdata=row_indices,
+                hovertemplate=hover_template,
+                legendgroup=y_col,
+            )
+        
+        fig.add_trace(trace)
+    
+    # 第一步：统计左右两侧各有多少根轴
+    total_count = len([col for col in all_y_columns if col in data.columns])
+    
+    if axis_placement == 'alternate':
+        # 左右交替：左侧=(total+1)//2，右侧=total//2
+        left_count = (total_count + 1) // 2
+        right_count = total_count // 2
+    else:
+        # 全部左侧
+        left_count = total_count
+        right_count = 0
+    
+    # 计算绘图区边界（先确定绘图区，再由内向外分配轴）
+    # 左侧轴区：编号0最靠近绘图区，编号越大越远离绘图区
+    # 右侧轴区：编号0最靠近绘图区，编号越大越远离绘图区
+    domain_left = left_count * axis_offset if left_count > 0 else 0.02
+    domain_right = 1.0 - right_count * axis_offset if right_count > 0 else 0.98
+    
+    # 第二步：为每根轴分配位置（由内向外编号：0, 1, 2...）
+    # 特征分配顺序：第1个→左0，第2个→右0，第3个→左1，第4个→右1...
+    axis_positions = []
+    left_slot = 0   # 左侧轴区当前槽位（由内向外：0, 1, 2...）
+    right_slot = 0  # 右侧轴区当前槽位（由内向外：0, 1, 2...）
+    
+    for idx, y_col in enumerate(all_y_columns):
+        if y_col not in data.columns:
+            continue
+        
+        color = color_palette[idx % len(color_palette)]
+        
+        # 确定side和slot（由内向外编号）
+        if axis_placement == 'alternate':
+            # 左右交替布局
+            if idx % 2 == 0:
+                # 左侧：槽位0在domain_left位置，槽位n在domain_left - n*axis_offset
+                side = 'left'
+                slot = left_slot
+                position = domain_left - slot * axis_offset
+                left_slot += 1
+            else:
+                # 右侧：槽位0在domain_right位置，槽位n在domain_right + n*axis_offset
+                side = 'right'
+                slot = right_slot
+                position = domain_right + slot * axis_offset
+                right_slot += 1
+        else:
+            # 全部左侧堆叠：槽位0在domain_left位置，槽位n在domain_left - n*axis_offset
+            side = 'left'
+            slot = left_slot
+            position = domain_left - slot * axis_offset
+            left_slot += 1
+        
+        # 记录轴信息（slot用于annotation上下交替和位置计算）
+        axis_positions.append((idx, side, position, color, y_col, slot))
+    
+    # 配置X轴
+    xaxis_config = {
+        'title': {'text': chart_config['x_column']},
+        'showgrid': chart_config.get('show_grid', True),
+        'showline': True,
+        'zeroline': True,
+        'fixedrange': False,
+        'exponentformat': 'none',
+        'separatethousands': True,
+        'domain': [domain_left, domain_right]  # 动态计算的作图区域
+    }
+    
+    # 配置所有Y轴（设置空title避免"click to enter"提示）
+    layout_update = {'xaxis': xaxis_config}
+    annotations = []  # 存储Y轴名称标注
+    
+    for idx, side, position, color, y_col, slot in axis_positions:
+        
+        # Y轴配置（设置空title避免"click to enter"提示）
+        if idx == 0:
+            # 第一个Y轴（主轴）
+            yaxis_config = {
+                'title': {'text': ''},  # 空title，避免显示"click to enter"
+                'tickfont': {'color': color, 'size': tick_font_size},
+                'showgrid': chart_config.get('show_grid', True),
+                'showline': True,
+                'linecolor': color,
+                'linewidth': 2,
+                'zeroline': False,
+                'fixedrange': False,
+                'exponentformat': 'none',
+                'tickformat': tick_format,
+                'side': side,
+                'anchor': 'free',  # 使用free才能让position生效
+                'position': position
+            }
+            layout_update['yaxis'] = yaxis_config
+        else:
+            # 其他Y轴
+            yaxis_config = {
+                'title': {'text': ''},  # 空title，避免显示"click to enter"
+                'tickfont': {'color': color, 'size': tick_font_size},
+                'overlaying': 'y',
+                'side': side,
+                'anchor': 'free',  # 使用free才能让position生效
+                'position': position,
+                'showgrid': False,
+                'showline': True,
+                'linecolor': color,
+                'linewidth': 2,
+                'zeroline': False,
+                'fixedrange': False,
+                'exponentformat': 'none',
+                'tickformat': tick_format
+            }
+            layout_update[f'yaxis{idx + 1}'] = yaxis_config
+        
+        # 计算 annotation 的 y 位置（上下交替）
+        # slot 是由内向外的编号：0最靠近绘图区，1, 2, 3...
+        # 偶数slot（0, 2, 4...）在上方，奇数slot（1, 3, 5...）在下方
+        if slot % 2 == 0:
+            annotation_y = 1.02
+            annotation_yanchor = 'bottom'
+        else:
+            annotation_y = -0.02
+            annotation_yanchor = 'top'
+        
+        # 添加Y轴名称标注
+        annotations.append(dict(
+            x=position,  # 直接使用轴的position，在轴正上方/正下方
+            y=annotation_y,
+            xref='paper',
+            yref='paper',
+            text=y_col,
+            showarrow=False,
+            font=dict(color=color, size=10),
+            xanchor='center',  # 居中对齐
+            yanchor=annotation_yanchor
+        ))
+    
+    # 设置整体布局
+    fig.update_layout(
+        title={
+            'text': chart_config['title'],
+            'xanchor': 'left',
+            'x': 0
+        },
+        hovermode='x unified',  # 统一显示所有曲线的值
+        width=chart_config.get('width', 1200),
+        height=chart_config['height'],
+        showlegend=True,
+        legend={
+            'orientation': 'h',  # 横向排列
+            'yanchor': 'bottom',
+            'y': 1.02,  # 放在图上方
+            'xanchor': 'center',
+            'x': 0.5,  # 居中
+            'font': {'size': 11},
+            'bgcolor': 'rgba(255, 255, 255, 0)',  # 透明背景
+            'bordercolor': 'rgba(0, 0, 0, 0)'  # 透明边框
+        },
+        dragmode='zoom',
+        annotations=annotations,  # 添加Y轴名称标注
+        **layout_update
+    )
+    
+    # 配置交互选项
+    config = {
+        'scrollZoom': True,
+        'displayModeBar': True,
+        'displaylogo': False,
+        'editable': True,
+        'edits': {
+            'titleText': True,
+            'axisTitleText': False,  # 禁止编辑Y轴标题，避免误触
+        }
+    }
+    
+    return fig, config
+
+
+def create_plotly_chart(chart_config, data, original_indices=None):
     """根据配置创建Plotly图表"""
     
     # 判断是否有双y轴
@@ -541,13 +1502,34 @@ def create_plotly_chart(chart_config, data):
     # 创建图表
     fig = go.Figure()
     
+    # 准备行索引数据（如果提供）
+    if original_indices is not None:
+        row_indices = original_indices
+    else:
+        row_indices = data.index.tolist()
+    
     # 添加Y1轴的曲线
+    is_first_trace = True
     for y_col in y1_columns:
         if y_col not in data.columns:
             continue
             
         x_data = data[chart_config['x_column']]
         y_data = data[y_col]
+        
+        # 检测y数据类型，如果是字符串类型则不使用数值格式化
+        is_numeric = pd.api.types.is_numeric_dtype(y_data)
+        if is_numeric:
+            y_hover = f'%{{y{hover_format}}}'
+        else:
+            y_hover = '%{y}'
+        
+        # 第一个 trace 显示行索引
+        if is_first_trace:
+            hover_template = f'<b>{y_col}</b>: {y_hover} (行索引: %{{customdata}})<extra></extra>'
+            is_first_trace = False
+        else:
+            hover_template = f'<b>{y_col}</b>: {y_hover}<extra></extra>'
         
         if chart_config['chart_type'] == '折线图':
             trace = go.Scatter(
@@ -556,7 +1538,8 @@ def create_plotly_chart(chart_config, data):
                 mode='lines',
                 name=y_col,
                 yaxis='y',
-                hovertemplate=f'<b>{y_col}</b>: %{{y{hover_format}}}<extra></extra>'
+                customdata=row_indices,
+                hovertemplate=hover_template
             )
         else:  # 散点图 - 使用Scattergl提升性能
             trace = go.Scattergl(
@@ -565,7 +1548,8 @@ def create_plotly_chart(chart_config, data):
                 mode='markers',
                 name=y_col,
                 yaxis='y',
-                hovertemplate=f'<b>{y_col}</b>: %{{y{hover_format}}}<extra></extra>'
+                customdata=row_indices,
+                hovertemplate=hover_template
             )
         
         fig.add_trace(trace)
@@ -578,6 +1562,20 @@ def create_plotly_chart(chart_config, data):
         x_data = data[chart_config['x_column']]
         y_data = data[y_col]
         
+        # 检测y数据类型，如果是字符串类型则不使用数值格式化
+        is_numeric = pd.api.types.is_numeric_dtype(y_data)
+        if is_numeric:
+            y_hover = f'%{{y{hover_format}}}'
+        else:
+            y_hover = '%{y}'
+        
+        # 如果 Y1 为空，在第一个 Y2 trace 显示行索引
+        if is_first_trace:
+            hover_template = f'<b>{y_col}</b>: {y_hover} (行索引: %{{customdata}})<extra></extra>'
+            is_first_trace = False
+        else:
+            hover_template = f'<b>{y_col}</b>: {y_hover}<extra></extra>'
+        
         if chart_config['chart_type'] == '折线图':
             trace = go.Scatter(
                 x=x_data,
@@ -585,7 +1583,8 @@ def create_plotly_chart(chart_config, data):
                 mode='lines',
                 name=y_col,
                 yaxis='y2',
-                hovertemplate=f'<b>{y_col}</b>: %{{y{hover_format}}}<extra></extra>'
+                customdata=row_indices,
+                hovertemplate=hover_template
             )
         else:  # 散点图 - 使用Scattergl提升性能
             trace = go.Scattergl(
@@ -594,7 +1593,8 @@ def create_plotly_chart(chart_config, data):
                 mode='markers',
                 name=y_col,
                 yaxis='y2',
-                hovertemplate=f'<b>{y_col}</b>: %{{y{hover_format}}}<extra></extra>'
+                customdata=row_indices,
+                hovertemplate=hover_template
             )
         
         fig.add_trace(trace)
@@ -636,11 +1636,11 @@ def create_plotly_chart(chart_config, data):
         'height': chart_config['height'],
         'showlegend': True,
         'legend': {
-            'orientation': 'v',
-            'yanchor': 'top',
-            'y': 1,
-            'xanchor': 'left',
-            'x': 1.10  # 图例位置：在Y2轴名称右侧，保持适当间距
+            'orientation': 'h',  # 横向排列
+            'yanchor': 'bottom',
+            'y': 1.02,  # 放在图上方
+            'xanchor': 'center',
+            'x': 0.5  # 居中
         },
         'dragmode': 'zoom'  # 支持缩放模式
     }
@@ -669,7 +1669,6 @@ def create_plotly_chart(chart_config, data):
         'scrollZoom': True,  # 启用滚轮缩放
         'displayModeBar': True,
         'displaylogo': False,
-        'modeBarButtonsToAdd': ['drawopenpath', 'eraseshape'],
         'editable': True,  # 启用标题编辑
         'edits': {
             'titleText': True,  # 可编辑图表标题
@@ -686,6 +1685,7 @@ st.markdown("---")
 # 侧边栏：文件上传
 with st.sidebar:
     st.header("📁 数据加载")
+    
     uploaded_files = st.file_uploader(
         "上传CSV或Excel文件（可多选）",
         type=['csv', 'xlsx', 'xls'],
@@ -701,11 +1701,13 @@ with st.sidebar:
         # 添加新文件
         for uploaded_file in uploaded_files:
             if uploaded_file.name not in existing_filenames:
-                data, list_columns_info = load_data(uploaded_file)
+                data, list_columns_info, is_large, downsampled_df = load_data(uploaded_file, st.session_state.downsample_ratio)
                 if data is not None:
                     st.session_state.files_data[uploaded_file.name] = {
                         'data': data,
-                        'list_columns_info': list_columns_info
+                        'list_columns_info': list_columns_info,
+                        'is_large': is_large,
+                        'downsampled': downsampled_df
                     }
         
         # 删除已移除的文件
@@ -748,11 +1750,20 @@ with st.sidebar:
             
             # 显示每个文件的信息
             for filename, file_info in st.session_state.files_data.items():
-                with st.expander(f"📄 {filename}"):
+                # 为大文件添加标记
+                file_display = f"📄 {filename}"
+                if file_info.get('is_large', False):
+                    file_display = f"📦 {filename} (大文件)"
+                
+                with st.expander(file_display):
                     data = file_info['data']
                     list_columns_info = file_info['list_columns_info']
+                    is_large = file_info.get('is_large', False)
                     
-                    st.info(f"数据形状: {data.shape[0]} 行 × {data.shape[1]} 列")
+                    if is_large:
+                        st.info(f"📊 数据形状: {data.shape[0]:,} 行 × {data.shape[1]} 列 (已启用降采样优化)")
+                    else:
+                        st.info(f"数据形状: {data.shape[0]:,} 行 × {data.shape[1]} 列")
                     
                     # 显示列表列信息
                     if list_columns_info:
@@ -836,7 +1847,12 @@ def add_new_chart(position=None):
         'width': 2000,  # 图表宽度
         'height': 500,
         'decimal_places': 2,
-        'is_configured': False  # 标记图表是否已配置
+        'overlay_mode': False,  # 重叠模式开关
+        'axis_placement': 'alternate',  # Y轴排布策略：'alternate'(左右交替) 或 'left'(左侧堆叠)
+        'is_configured': False,  # 标记图表是否已配置
+        'use_downsample': True,  # 默认使用降采样（如果是大文件）
+        'range_start': None,  # 范围起始
+        'range_end': None  # 范围结束
     }
     if position is None:
         st.session_state.charts.append(new_chart)
@@ -845,6 +1861,10 @@ def add_new_chart(position=None):
         st.session_state.charts.insert(position + 1, new_chart)
         new_idx = position + 1
     st.session_state.edit_mode[new_idx] = True  # 新图表默认打开编辑模式
+    
+    # 初始化图表的范围模式
+    st.session_state.chart_range_mode[new_idx] = 'downsampled'
+    st.session_state.chart_range_selection[new_idx] = None
 
 # 渲染单个图表区域
 def render_chart_area(idx, chart_config):
@@ -871,176 +1891,9 @@ def render_chart_area(idx, chart_config):
                     del st.session_state.edit_mode[idx]
                 st.rerun()
         
-        # 属性编辑面板（仅在编辑模式下显示）
+        # 属性编辑面板（仅在编辑模式下显示）- 使用 fragment 避免属性修改时刷新整个页面
         if st.session_state.edit_mode.get(idx, False):
-            st.markdown("##### 📋 图表属性")
-            
-            # 如果有多个文件，显示数据源选择
-            filenames = list(st.session_state.files_data.keys())
-            if len(filenames) > 1:
-                st.markdown("**📂 数据来源**")
-                current_source = chart_config.get('data_source', None)
-                if current_source not in filenames:
-                    current_source = None
-                
-                source_index = filenames.index(current_source) if current_source else 0
-                new_data_source = st.selectbox(
-                    "选择数据文件",
-                    filenames,
-                    index=source_index,
-                    key=f"data_source_{idx}",
-                    help="选择该图表使用的数据文件"
-                )
-                
-                # 如果数据源改变，更新图表配置并重置列选择
-                if new_data_source != chart_config.get('data_source'):
-                    # 更新图表配置
-                    chart_config['data_source'] = new_data_source
-                    chart_config['y1_columns'] = []
-                    chart_config['y2_columns'] = []
-                    chart_config['y1_selections'] = {'normal': [], 'list_columns': {}}
-                    chart_config['y2_selections'] = {'normal': [], 'list_columns': {}}
-                    chart_config['y1_selected_columns'] = []
-                    chart_config['y2_selected_columns'] = []
-                    chart_config['is_configured'] = False
-                    
-                    # 重置X轴为新数据源的第一列
-                    if new_data_source and new_data_source in st.session_state.files_data:
-                        new_data = st.session_state.files_data[new_data_source]['data']
-                        chart_config['x_column'] = new_data.columns[0] if len(new_data.columns) > 0 else ''
-                    
-                    # 清理该图表的所有相关状态
-                    clear_chart_states(idx)
-                    
-                    st.warning(f"⚠️ 数据源已切换到 '{new_data_source}'，列选择已重置")
-                    st.rerun()
-            
-            # 检查是否选择了数据源
-            data_source = chart_config.get('data_source')
-            if not data_source:
-                st.error("⚠️ 请先选择数据来源！")
-                return
-            
-            # 获取对应的数据和列信息
-            if data_source not in st.session_state.files_data:
-                st.error(f"❌ 数据文件 '{data_source}' 不存在！")
-                return
-            
-            file_info = st.session_state.files_data[data_source]
-            data = file_info['data']
-            list_columns_info = file_info['list_columns_info']
-            columns = data.columns.tolist()
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                new_title = st.text_input(
-                    "图表标题", 
-                    value=chart_config['title'],
-                    key=f"title_{idx}",
-                    help="双击图表可快速修改标题"
-                )
-                new_chart_type = st.selectbox(
-                    "图表类型", 
-                    ['折线图', '散点图'],
-                    index=['折线图', '散点图'].index(chart_config['chart_type']),
-                    key=f"type_{idx}"
-                )
-                new_x_column = st.selectbox(
-                    "X轴 (横坐标)", 
-                    columns,
-                    index=columns.index(chart_config['x_column']) if chart_config['x_column'] in columns else 0,
-                    key=f"x_{idx}"
-                )
-                # 使用新的列选择器V2
-                y1_default = chart_config.get('y1_selected_columns', [])
-                y1_selections = render_column_selector_v2(
-                    "Y1轴 (左侧纵坐标)",
-                    columns,
-                    y1_default,
-                    f"y1_{idx}",
-                    list_columns_info,
-                    data
-                )
-            
-            with col2:
-                new_width = st.slider(
-                    "图表宽度 (像素)", 
-                    600, 2000, 
-                    chart_config.get('width', 1200), 
-                    50,
-                    key=f"width_{idx}"
-                )
-                new_height = st.slider(
-                    "图表高度 (像素)", 
-                    300, 800, 
-                    chart_config['height'], 
-                    50,
-                    key=f"height_{idx}"
-                )
-                new_show_grid = st.checkbox(
-                    "显示网格", 
-                    value=chart_config['show_grid'],
-                    key=f"grid_{idx}"
-                )
-                new_decimal_places = st.selectbox(
-                    "数值小数位数",
-                    options=[0, 1, 2, 3, 4, 5, 6],
-                    index=chart_config['decimal_places'],
-                    help="控制悬浮框和坐标轴刻度显示的小数位数",
-                    key=f"decimal_{idx}"
-                )
-                # 使用新的列选择器V2
-                y2_default = chart_config.get('y2_selected_columns', [])
-                y2_selections = render_column_selector_v2(
-                    "Y2轴 (右侧纵坐标)",
-                    columns,
-                    y2_default,
-                    f"y2_{idx}",
-                    list_columns_info,
-                    data
-                )
-            
-            # 应用按钮
-            if st.button("✅ 应用修改", key=f"apply_{idx}", type="primary"):
-                # 检查是否有选中列
-                y1_total = len(y1_selections['normal']) + sum(len(chs) for chs in y1_selections['list_columns'].values())
-                y2_total = len(y2_selections['normal']) + sum(len(chs) for chs in y2_selections['list_columns'].values())
-                
-                if y1_total == 0 and y2_total == 0:
-                    st.error("请至少为Y1轴或Y2轴选择一个列！")
-                else:
-                    # 生成实际的列名列表（用于绘图）
-                    y1_column_names = y1_selections['normal'].copy()
-                    for list_col, channel_indices in y1_selections['list_columns'].items():
-                        for ch_idx in channel_indices:
-                            y1_column_names.append(f"{list_col} #{ch_idx+1}")
-                    
-                    y2_column_names = y2_selections['normal'].copy()
-                    for list_col, channel_indices in y2_selections['list_columns'].items():
-                        for ch_idx in channel_indices:
-                            y2_column_names.append(f"{list_col} #{ch_idx+1}")
-                    
-                    # 更新图表配置
-                    st.session_state.charts[idx].update({
-                        'title': new_title,
-                        'chart_type': new_chart_type,
-                        'data_source': data_source,  # 保存数据源
-                        'x_column': new_x_column,
-                        'y1_columns': y1_column_names,  # 实际列名
-                        'y2_columns': y2_column_names,  # 实际列名
-                        'y1_selections': y1_selections,  # 保存选择状态
-                        'y2_selections': y2_selections,  # 保存选择状态
-                        'y1_selected_columns': y1_column_names,  # 用于下次打开时回显
-                        'y2_selected_columns': y2_column_names,
-                        'show_grid': new_show_grid,
-                        'width': new_width,
-                        'height': new_height,
-                        'decimal_places': new_decimal_places,
-                        'is_configured': True
-                    })
-                    st.success("✅ 配置已更新！")
-                    st.rerun()
+            render_chart_properties_fragment(idx, chart_config)
             
             # 属性和图表之间的虚线分隔
             st.markdown('<div class="property-separator"></div>', unsafe_allow_html=True)
@@ -1056,8 +1909,9 @@ def render_chart_area(idx, chart_config):
             try:
                 # 获取对应的数据和列表列信息
                 file_info = st.session_state.files_data[data_source]
-                data = file_info['data']
+                original_data = file_info['data']
                 list_columns_info = file_info['list_columns_info']
+                is_large_file = file_info.get('is_large', False)
                 
                 # 准备绘图数据（按需展开列表列）
                 y1_selections = chart_config.get('y1_selections', {'normal': chart_config.get('y1_columns', []), 'list_columns': {}})
@@ -1073,13 +1927,226 @@ def render_chart_area(idx, chart_config):
                     ch2 = y2_selections.get('list_columns', {}).get(list_col, [])
                     all_selections['list_columns'][list_col] = list(set(ch1 + ch2))
                 
-                # 准备完整的数据
-                plot_data = prepare_plot_data(data, all_selections, list_columns_info, data_source)
+                # 大文件处理：显示模式切换控件
+                if is_large_file:
+                    st.markdown("##### 🔍 大文件显示模式")
+                    
+                    # 降采样倍数设置
+                    ratio_col, info_ratio_col = st.columns([1, 3])
+                    with ratio_col:
+                        new_ratio = st.number_input(
+                            "降采样倍数",
+                            min_value=10,
+                            max_value=1000,
+                            value=st.session_state.downsample_ratio,
+                            step=10,
+                            key=f"downsample_ratio_chart_{idx}",
+                            help="原始数据行数除以此倍数得到降采样后的点数"
+                        )
+                        if new_ratio != st.session_state.downsample_ratio:
+                            st.session_state.downsample_ratio = new_ratio
+                            st.rerun()
+                    with info_ratio_col:
+                        current_points = max(1000, len(original_data) // st.session_state.downsample_ratio)
+                        st.caption(f"💡 当前设置：{len(original_data):,}行 ÷ {st.session_state.downsample_ratio} = 约{current_points:,}点")
+                    
+                    # 初始化该图表的范围模式
+                    if idx not in st.session_state.chart_range_mode:
+                        st.session_state.chart_range_mode[idx] = 'downsampled'
+                        st.session_state.chart_data_ready[idx] = True  # 降采样模式默认准备好
+                    
+                    mode_col, info_col = st.columns([2, 3])
+                    
+                    with mode_col:
+                        current_mode = st.session_state.chart_range_mode[idx]
+                        # 动态计算显示的降采样点数
+                        estimated_points = max(1000, len(original_data) // st.session_state.downsample_ratio)
+                        mode_options = {
+                            'downsampled': f'📉 降采样预览 ({st.session_state.downsample_ratio}x, 约{estimated_points:,}点)',
+                            'original': '📊 原始数据'
+                        }
+                        
+                        selected_mode = st.radio(
+                            "选择显示模式",
+                            options=list(mode_options.keys()),
+                            format_func=lambda x: mode_options[x],
+                            index=0 if current_mode == 'downsampled' else 1,
+                            key=f"display_mode_{idx}",
+                            horizontal=True
+                        )
+                        
+                        if selected_mode != current_mode:
+                            st.session_state.chart_range_mode[idx] = selected_mode
+                            
+                            # 切换到原始数据模式时的处理
+                            if selected_mode == 'original':
+                                # 标记为未准备好绘图（需要用户确认）
+                                st.session_state.chart_data_ready[idx] = False
+                                
+                                # 如果还没有设置范围，使用默认值（中间20%）
+                                if idx not in st.session_state.chart_range_selection or st.session_state.chart_range_selection[idx] is None:
+                                    x_col = chart_config.get('x_column')
+                                    if x_col and x_col in original_data.columns:
+                                        is_numeric_x = pd.api.types.is_numeric_dtype(original_data[x_col])
+                                        total_rows = len(original_data)
+                                        
+                                        if is_numeric_x:
+                                            # 数值型X轴：取中间20%范围
+                                            x_min = float(original_data[x_col].min())
+                                            x_max = float(original_data[x_col].max())
+                                            x_range = x_max - x_min
+                                            range_start = x_min + x_range * 0.4
+                                            range_end = x_min + x_range * 0.6
+                                        else:
+                                            # 非数值型X轴：取中间20%行
+                                            range_start = int(total_rows * 0.4)
+                                            range_end = int(total_rows * 0.6)
+                                        
+                                        st.session_state.chart_range_selection[idx] = (range_start, range_end)
+                            else:
+                                # 切换回降采样模式，自动准备好
+                                st.session_state.chart_data_ready[idx] = True
+                            
+                            st.rerun()
+                    
+                    with info_col:
+                        if selected_mode == 'downsampled':
+                            st.info(f"💡 当前显示降采样后的全局预览数据 (原始数据: {len(original_data):,} 行)")
+                        else:
+                            st.info(f"💡 当前显示原始颗粒度数据")
+                    
+                    # 原始数据模式：范围选择
+                    if selected_mode == 'original':
+                        st.markdown("**📍 选择数据范围**")
+                        
+                        # 三向联动：降采样图行号 ↔ 原始数据行号 ↔ 百分比
+                        st.markdown("**📊 范围选择（三向联动）**")
+                        st.caption("💡 从降采样图的hover中读取行索引，或直接填写百分比/原始行号，三者自动联动")
+                        
+                        x_col = chart_config.get('x_column')
+                        if x_col and x_col in original_data.columns:
+                            total_rows = len(original_data)
+                            downsampled_rows = max(1000, total_rows // st.session_state.downsample_ratio)
+                            
+                            # 使用 fragment 渲染输入控件，使输入变化只刷新输入部分，不影响图表
+                            render_range_input_controls(idx, total_rows, downsampled_rows, x_col, original_data)
+                        
+                        st.markdown("---")
+                        
+                        # 绘制按钮（放在 fragment 外面，确保点击时触发整个页面刷新）
+                        col_btn1, col_btn2 = st.columns([1, 3])
+                        with col_btn1:
+                            if st.button("🎨 绘制原始数据图表", key=f"draw_original_{idx}", type="primary", use_container_width=True):
+                                # 将当前选择的范围保存为确认范围
+                                st.session_state.confirmed_chart_range[idx] = st.session_state.chart_range_selection.get(idx)
+                                st.session_state.chart_data_ready[idx] = True
+                                st.rerun()
+                        with col_btn2:
+                            st.caption("💡 点击按钮后将加载并绘制选定范围的原始数据")
+                    
+                    st.markdown("---")
                 
-                # 创建图表
-                fig, config = create_plotly_chart(chart_config, plot_data)
-                st.caption("💡 提示：可框选区域进行放大；鼠标悬停在坐标轴上可拖动，滚动滚轮可进行缩放；双击可重置视图。")
-                st.plotly_chart(fig, use_container_width=False, config=config, key=f"chart_{idx}")
+                # 确定应该显示哪种数据
+                show_downsampled = False  # 是否显示降采样数据
+                show_original = False     # 是否显示原始数据
+                show_config_only = False  # 是否只显示配置界面
+                
+                if is_large_file:
+                    if st.session_state.chart_range_mode.get(idx) == 'downsampled':
+                        # 降采样模式：显示降采样数据
+                        show_downsampled = True
+                    else:  # 原始数据模式
+                        if st.session_state.chart_data_ready.get(idx, False):
+                            # 已确认绘制：显示原始数据
+                            show_original = True
+                        else:
+                            # 未确认绘制：继续显示降采样图 + 配置界面
+                            show_downsampled = True
+                            st.info("💡 下方仍显示降采样预览图，配置好范围后点击「绘制原始数据图表」按钮查看精确数据")
+                else:
+                    # 非大文件：直接显示数据
+                    show_original = True
+                
+                if not show_downsampled and not show_original:
+                    # 不应该发生，但作为安全措施
+                    st.warning("⚠️ 无法确定显示模式")
+                else:
+                    # 根据显示模式准备数据
+                    use_downsample = False
+                    range_start = None
+                    range_end = None
+                    use_index_range = False
+                    
+                    if show_downsampled:
+                        # 显示降采样数据
+                        use_downsample = True
+                    elif show_original:
+                        # 显示原始数据
+                        # 使用已确认的范围（点击绘制按钮时保存的），而不是当前输入框的值
+                        if is_large_file and idx in st.session_state.confirmed_chart_range and st.session_state.confirmed_chart_range[idx]:
+                            # 大文件且有已确认的范围选择：使用范围过滤
+                            range_start, range_end = st.session_state.confirmed_chart_range[idx]
+                            
+                            # 检查X轴是否为数值类型，决定使用值范围还是索引范围
+                            x_col = chart_config.get('x_column')
+                            if x_col and x_col in original_data.columns:
+                                use_index_range = not pd.api.types.is_numeric_dtype(original_data[x_col])
+                
+                    # 获取所有Y轴列名（用于LTTB降采样）
+                    all_y_columns = chart_config.get('y1_columns', []) + chart_config.get('y2_columns', [])
+                    
+                    # 准备完整的数据
+                    plot_data, original_indices = prepare_plot_data(
+                        original_data, 
+                        all_selections, 
+                        list_columns_info, 
+                        data_source,
+                        use_downsample=use_downsample,
+                        x_column=chart_config.get('x_column'),
+                        y_columns=all_y_columns,
+                        range_start=range_start,
+                        range_end=range_end,
+                        use_index_range=use_index_range,
+                        downsample_ratio=st.session_state.downsample_ratio
+                    )
+                    
+                    # 显示实际绘图数据量
+                    if show_downsampled and is_large_file:
+                        st.success(f"✅ 已加载降采样数据：{len(plot_data):,} 点 (原始: {len(original_data):,} 行)")
+                    elif show_original and is_large_file:
+                        status_col, btn_col = st.columns([3, 1])
+                        with status_col:
+                            if range_start is not None and range_end is not None:
+                                st.success(f"✅ 已加载原始数据：{len(plot_data):,} 点 (范围内)")
+                            else:
+                                st.success(f"✅ 已加载原始数据：{len(plot_data):,} 点 (全部)")
+                        with btn_col:
+                            if st.button("🔄 重新配置", key=f"reconfig_{idx}", use_container_width=True):
+                                st.session_state.chart_data_ready[idx] = False
+                                st.rerun()
+                    
+                    # 创建图表（根据模式选择函数）
+                    if chart_config.get('overlay_mode', False):
+                        # 重叠模式
+                        fig, config = create_plotly_chart_overlay(chart_config, plot_data, original_indices)
+                    else:
+                        # 普通模式
+                        fig, config = create_plotly_chart(chart_config, plot_data, original_indices)
+                    
+                    # 提示信息
+                    if chart_config.get('overlay_mode', False):
+                        # 重叠模式的提示
+                        st.caption("💡 重叠模式提示：每条曲线使用独立的Y轴刻度（颜色关联）；可框选区域放大；鼠标悬停在Y轴上滚动滚轮可缩放该轴；双击Y轴自动适配；点击图例可隐藏/显示对应曲线。")
+                    elif show_downsampled and is_large_file:
+                        if st.session_state.chart_range_mode.get(idx) == 'downsampled':
+                            st.caption("💡 提示：当前为降采样预览模式。鼠标悬停查看数据点和行索引；框选放大可查看细节；切换到原始数据模式可加载精确数据。")
+                        else:
+                            st.caption("💡 提示：下方显示降采样预览图（用于参考）。鼠标悬停查看数据点和行索引；配置好范围后点击「绘制原始数据图表」查看精确数据。")
+                    elif show_original:
+                        st.caption("💡 提示：可框选区域进行放大；鼠标悬停查看数据点和原始行索引；鼠标悬停在坐标轴上可拖动，滚动滚轮可进行缩放；双击可重置视图。")
+                    
+                    # 显示图表
+                    st.plotly_chart(fig, use_container_width=False, config=config, key=f"chart_{idx}")
             except Exception as e:
                 st.error(f"绘制图表出错: {str(e)}")
                 import traceback
@@ -1149,12 +2216,18 @@ else:
     ### 功能特点
     - ✅ 支持CSV和Excel文件格式
     - ✅ **多文件支持**：可同时加载多个数据文件，每个图表独立选择数据源
+    - ✅ **🎨 重叠模式（新）**：多特征共享X轴，每个特征独立Y轴，颜色强关联（曲线-轴-图例同色）
+    - ✅ **Y轴智能排布**：支持左右交替或左侧堆叠两种布局，避免轴标签重叠
+    - ✅ **大文件智能优化**：超过50万行数据自动启用降采样，快速预览整体曲线
+    - ✅ **双模式显示**：大文件支持降采样预览和原始数据精细查看两种模式
+    - ✅ **范围选择加载**：可选定横轴范围，仅加载该范围内的原始颗粒度数据
+    - ✅ **LTTB降采样算法**：智能保留数据特征，确保降采样后曲线形态不失真，自动处理非数值数据
     - ✅ **自动解析列表列**：支持字符串形式的列表数据（如 "[2, 5, 8]"），自动展开为多个通道
     - ✅ **智能通道管理**：列表列自动分组显示，可选择性绘制指定通道
     - ✅ 交互式折线图和散点图
     - ✅ 自由选择X轴和多个Y轴列
     - ✅ **下拉勾选式列选择**：改进的列选择器，选中后保持可见
-    - ✅ 独立的Y1轴（左侧）和Y2轴（右侧）
+    - ✅ 独立的Y1轴（左侧）和Y2轴（右侧）（普通模式）
     - ✅ 可选显示网格
     - ✅ 纵向虚线联动显示所有曲线的值
     - ✅ 完整数值显示，可控制小数位数
@@ -1188,6 +2261,37 @@ else:
       - 有多个文件时，需要手动为每个图表选择数据源
     - **数据源显示**: 有多个文件时，图表标题后会显示数据源文件名标签
     
+    ### 🎨 重叠模式（多特征独立Y轴）
+    当多个特征的量纲和数值范围差异很大时（如温度、压力、速度等），传统的双Y轴不够用。**重叠模式**让你可以在同一张图中绘制任意多个特征，每个特征都有独立的Y轴刻度。
+    
+    **核心特性：**
+    - **颜色强关联**：每条曲线、对应的Y轴刻度、图例文字使用相同的高辨识度颜色（最多支持10种颜色）
+    - **Y轴智能排布**：
+      - **左右交替**（推荐）：Y轴在左右两侧交替排列，充分利用空间
+      - **左侧堆叠**：所有Y轴在左侧排列，适合需要集中查看的场景
+    - **统一crosshair**：鼠标悬停时，垂直虚线贯穿所有曲线，tooltip同时显示所有特征值
+    - **独立缩放**：鼠标悬停在某个Y轴上滚动滚轮，只缩放该轴对应的曲线
+    - **自动适配**：双击某个Y轴，该曲线自动适配到最佳显示范围
+    
+    **使用方法：**
+    1. 在属性面板中勾选「🔄 启用重叠模式」
+    2. 选择Y轴排布策略（左右交替 或 左侧堆叠）
+    3. 在「Y轴特征」中选择要对比的多个特征（建议不超过10个）
+    4. 点击「✅ 应用修改」查看效果
+    
+    **适用场景：**
+    - ✅ 多传感器数据对比（温度、压力、流量等不同量纲）
+    - ✅ 多通道信号分析（不同幅值范围的信号）
+    - ✅ 多指标趋势对比（销量、利润率、库存等）
+    - ✅ 时序数据的多维度观察
+    
+    **交互提示：**
+    - 点击图例可隐藏/显示对应曲线
+    - 框选区域可放大X轴范围（所有曲线同步）
+    - 鼠标悬停在Y轴上滚轮缩放该轴（曲线上下拉伸）
+    - 双击Y轴自动适配该曲线到合适范围
+    - 双击图表区域重置所有视图
+    
     ### 图表管理
     - **编辑模式**: 点击「⚙️ 编辑属性」打开面板，点击「⚙️ 收起属性」隐藏面板
     - **删除图表**: 点击「🗑️ 删除该图」删除单个图表
@@ -1202,6 +2306,30 @@ else:
     - **联动悬停**: 鼠标悬停时显示纵向虚线，同时显示所有曲线在该位置的值
     - **图例**: 点击图例可以显示/隐藏对应曲线
     - **编辑标题**: 双击图表标题或坐标轴标题可以直接编辑（点击图表外保存）
+    
+    ### 大文件智能优化 🚀
+    - **自动检测**：系统自动识别超过50万行的大文件，并标记为"大文件"
+    - **降采样预览模式**：
+      - 使用LTTB算法智能降采样到约10,000点
+      - 保留数据的主要特征和趋势
+      - 快速显示全局曲线样貌，无需等待（1-3秒）
+      - 自动检测数据类型，非数值型X轴自动回退到简单采样
+    - **原始数据模式**：
+      - 可选择横轴的特定范围
+      - 仅加载该范围内的原始颗粒度数据
+      - 确保局部细节的精确显示
+    - **模式切换**：
+      - 📉 降采样预览：快速查看全局趋势（约10,000点）
+      - 📊 原始数据：精细查看特定区间（完整颗粒度）
+    - **使用建议**：
+      1. 先用降采样模式快速浏览全局（100万行 → 10,000点，秒级加载）
+      2. 发现感兴趣的区域后，切换到原始数据模式
+      3. 设置横轴范围，加载该区域的高精度数据
+      4. 可根据需要反复切换和调整范围
+    - **智能容错**：
+      - X轴必须是数值型才能使用LTTB算法
+      - 非数值型数据自动使用简单均匀采样
+      - 完善的错误处理，确保稳定性
     
     ### 列表列功能
     - **自动检测**：系统会自动检测包含列表字符串的列（如 `"[2, 5, 8]"`）
@@ -1225,12 +2353,32 @@ else:
     - 💡 修改属性后点击「应用修改」，图表会在原位置重新绘制，不会创建新图区
     - 💡 双击图表标题、X轴标题或Y轴标题可以快速修改文字
     - 💡 列表列支持不同长度，系统会自动处理缺失值
+    - 🚀 **大文件优化**：超过50万行自动启用降采样，先看全局再看细节
+    - 🚀 **LTTB算法**：降采样保留数据特征，曲线形态几乎无损，自动处理非数值数据
+    - 🚀 **灵活切换**：降采样和原始数据模式可随时切换，满足不同需求
+    - 🚀 **智能容错**：X轴非数值型自动回退到简单采样，确保系统稳定运行
     """)
 
 # 页脚
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: gray;'>交互式绘图工具 v2.0 (多文件支持) | Developer: yinmingxin</div>",
+    "<div style='text-align: center; color: gray;'>交互式绘图工具 v2.2 (重叠模式 + 多Y轴独立刻度) | Developer: yinmingxin</div>",
     unsafe_allow_html=True
 )
+
+# 直接运行支持
+if __name__ == "__main__":
+    try:
+        # 检查是否在streamlit运行时环境中
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            # 不在streamlit中，启动streamlit
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "-m", "streamlit", "run", __file__])
+    except:
+        # 如果导入失败或其他错误，启动streamlit
+        import subprocess
+        import sys
+        subprocess.run([sys.executable, "-m", "streamlit", "run", __file__])
 
