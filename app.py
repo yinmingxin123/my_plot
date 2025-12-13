@@ -35,6 +35,8 @@ if 'chart_data_ready' not in st.session_state:
     st.session_state.chart_data_ready = {}  # 记录原始数据模式下是否已确认绘制
 if 'downsample_ratio' not in st.session_state:
     st.session_state.downsample_ratio = 100  # 默认降采样倍数
+if 'histogram_bins' not in st.session_state:
+    st.session_state.histogram_bins = {}  # 记录每个直方图的bin数量
 
 # Fragment 函数：原始数据模式的范围选择输入控件
 # 使用 @st.fragment 使输入变化时只刷新输入部分，不影响图表
@@ -299,33 +301,145 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
     file_info = st.session_state.files_data[data_source]
     data = file_info['data']
     list_columns_info = file_info['list_columns_info']
+    is_large_file = file_info.get('is_large', False)
     columns = data.columns.tolist()
     
-    # 重叠模式开关（显著标识）
+    # 显示数据行数和文件显示模式
     st.markdown("---")
-    st.markdown("### 🎨 绘图模式")
-    overlay_mode = st.checkbox(
-        "🔄 启用重叠模式（多特征共享X轴，每个特征独立Y轴）",
-        value=chart_config.get('overlay_mode', False),
-        key=f"overlay_mode_{idx}",
-        help="启用后，所有选中的特征将绘制在同一图表中，每个特征使用独立的Y轴刻度，并通过颜色关联。适合量纲差异大的多特征对比。"
+    st.markdown("### 📊 数据信息与显示模式")
+    
+    # 显示行数
+    row_count = len(data)
+    if is_large_file:
+        st.info(f"📊 **数据行数: {row_count:,} 行** (大文件)")
+    else:
+        st.info(f"📊 **数据行数: {row_count:,} 行**")
+    
+    # 初始化该图表的范围模式（大文件默认降采样，非大文件默认原始数据）
+    if idx not in st.session_state.chart_range_mode:
+        default_mode = 'downsampled' if is_large_file else 'original'
+        st.session_state.chart_range_mode[idx] = default_mode
+        st.session_state.chart_data_ready[idx] = True  # 都默认准备好
+    
+    # 显示模式选择
+    mode_col, ratio_col = st.columns([2, 2])
+    
+    with mode_col:
+        current_mode = st.session_state.chart_range_mode[idx]
+        estimated_points = max(1000, row_count // st.session_state.downsample_ratio)
+        mode_options = {
+            'downsampled': f'📉 降采样预览 ({st.session_state.downsample_ratio}x, 约{estimated_points:,}点)',
+            'original': '📊 原始数据'
+        }
+        
+        selected_mode = st.radio(
+            "文件显示模式",
+            options=list(mode_options.keys()),
+            format_func=lambda x: mode_options[x],
+            index=0 if current_mode == 'downsampled' else 1,
+            key=f"display_mode_prop_{idx}",
+            horizontal=True,
+            help="降采样预览：快速查看概览；原始数据：显示完整颗粒度"
+        )
+        
+        if selected_mode != current_mode:
+            st.session_state.chart_range_mode[idx] = selected_mode
+            if selected_mode == 'downsampled':
+                st.session_state.chart_data_ready[idx] = True
+            else:
+                st.session_state.chart_data_ready[idx] = False
+            st.rerun()
+    
+    with ratio_col:
+        # 降采样倍数设置（仅在降采样模式下显示）
+        if selected_mode == 'downsampled':
+            new_ratio = st.number_input(
+                "降采样倍数",
+                min_value=1,
+                max_value=1000,
+                value=st.session_state.downsample_ratio,
+                step=1,
+                key=f"downsample_ratio_prop_{idx}",
+                help="原始数据行数除以此倍数得到降采样后的点数"
+            )
+            if new_ratio != st.session_state.downsample_ratio:
+                st.session_state.downsample_ratio = new_ratio
+                st.rerun()
+            
+            current_points = max(1000, row_count // st.session_state.downsample_ratio)
+            st.caption(f"💡 {row_count:,}行 ÷ {st.session_state.downsample_ratio} = 约{current_points:,}点")
+    
+    # 首先选择图表类型（放在最前面，因为后续选项依赖于此）
+    st.markdown("---")
+    st.markdown("### 📈 图表类型")
+    chart_types = ['折线图', '散点图', '直方图']
+    current_type = chart_config['chart_type']
+    if current_type not in chart_types:
+        current_type = '折线图'
+    new_chart_type = st.selectbox(
+        "选择图表类型", 
+        chart_types,
+        index=chart_types.index(current_type),
+        key=f"type_{idx}"
     )
     
-    if overlay_mode:
-        st.info("💡 重叠模式已启用：所有Y轴特征将使用独立刻度，通过颜色强关联（曲线、Y轴、图例同色）")
-        
-        # 重叠模式下的轴排布策略
-        axis_placement = st.radio(
-            "Y轴排布策略",
-            options=['alternate', 'left'],
-            format_func=lambda x: '左右交替' if x == 'alternate' else '左侧堆叠',
-            index=0 if chart_config.get('axis_placement', 'alternate') == 'alternate' else 1,
-            key=f"axis_placement_{idx}",
-            horizontal=True,
-            help="左右交替：Y轴在左右两侧交替排列；左侧堆叠：所有Y轴在左侧堆叠排列"
+    # 重叠模式开关（仅折线图和散点图显示）
+    if new_chart_type != '直方图':
+        st.markdown("---")
+        st.markdown("### 🎨 绘图模式")
+        overlay_mode = st.checkbox(
+            "🔄 启用重叠模式（多特征共享X轴，每个特征独立Y轴）",
+            value=chart_config.get('overlay_mode', False),
+            key=f"overlay_mode_{idx}",
+            help="启用后，所有选中的特征将绘制在同一图表中，每个特征使用独立的Y轴刻度，并通过颜色关联。适合量纲差异大的多特征对比。"
         )
+        
+        if overlay_mode:
+            st.info("💡 重叠模式已启用：所有Y轴特征将使用独立刻度，通过颜色强关联（曲线、Y轴、图例同色）")
+            
+            # 重叠模式下的轴排布策略
+            axis_placement = st.radio(
+                "Y轴排布策略",
+                options=['alternate', 'left'],
+                format_func=lambda x: '左右交替' if x == 'alternate' else '左侧堆叠',
+                index=0 if chart_config.get('axis_placement', 'alternate') == 'alternate' else 1,
+                key=f"axis_placement_{idx}",
+                horizontal=True,
+                help="左右交替：Y轴在左右两侧交替排列；左侧堆叠：所有Y轴在左侧堆叠排列"
+            )
+        else:
+            axis_placement = 'alternate'
     else:
+        # 直方图模式下不使用重叠模式
+        overlay_mode = False
         axis_placement = 'alternate'
+        
+        # 直方图特有设置
+        st.markdown("---")
+        st.markdown("### 📊 直方图设置")
+        
+        # 初始化bin数量
+        if idx not in st.session_state.histogram_bins:
+            st.session_state.histogram_bins[idx] = chart_config.get('histogram_bins', 50)
+        
+        histogram_bins = st.slider(
+            "分箱数 (Bins)",
+            min_value=5,
+            max_value=500,
+            value=st.session_state.histogram_bins[idx],
+            step=5,
+            key=f"hist_bins_{idx}",
+            help="控制直方图的分箱数量，数值越大柱子越细"
+        )
+        st.session_state.histogram_bins[idx] = histogram_bins
+        
+        # 显示模式选择
+        hist_normalize = st.checkbox(
+            "归一化显示（概率密度）",
+            value=chart_config.get('hist_normalize', False),
+            key=f"hist_normalize_{idx}",
+            help="勾选后显示概率密度而非频数"
+        )
     
     st.markdown("---")
     
@@ -338,21 +452,39 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
             key=f"title_{idx}",
             help="双击图表可快速修改标题"
         )
-        new_chart_type = st.selectbox(
-            "图表类型", 
-            ['折线图', '散点图'],
-            index=['折线图', '散点图'].index(chart_config['chart_type']),
-            key=f"type_{idx}"
-        )
-        new_x_column = st.selectbox(
-            "X轴 (横坐标)", 
-            columns,
-            index=columns.index(chart_config['x_column']) if chart_config['x_column'] in columns else 0,
-            key=f"x_{idx}"
-        )
+        
+        # 非直方图模式才设置直方图默认值
+        if new_chart_type != '直方图':
+            histogram_bins = chart_config.get('histogram_bins', 50)
+            hist_normalize = chart_config.get('hist_normalize', False)
+        
+        # 直方图模式下不需要选择X轴
+        if new_chart_type != '直方图':
+            new_x_column = st.selectbox(
+                "X轴 (横坐标)", 
+                columns,
+                index=columns.index(chart_config['x_column']) if chart_config['x_column'] in columns else 0,
+                key=f"x_{idx}"
+            )
+        else:
+            # 直方图模式下使用默认的第一列作为X轴（实际不会用到）
+            new_x_column = chart_config.get('x_column', columns[0] if columns else '')
         
         # 根据模式显示不同的Y轴选择器
-        if overlay_mode:
+        if new_chart_type == '直方图':
+            # 直方图模式：只需要选择要分析的特征
+            y1_default = chart_config.get('y1_selected_columns', [])
+            y1_selections = render_column_selector_v2(
+                "📊 选择要分析的特征（支持多选）",
+                columns,
+                y1_default,
+                f"y1_{idx}",
+                list_columns_info,
+                data
+            )
+            # 直方图模式下Y2为空
+            y2_selections = {'normal': [], 'list_columns': {}}
+        elif overlay_mode:
             # 重叠模式：不区分Y1/Y2，统一选择
             y1_default = chart_config.get('y1_selected_columns', [])
             y1_selections = render_column_selector_v2(
@@ -405,8 +537,8 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
             key=f"decimal_{idx}"
         )
         
-        # 普通模式下显示Y2轴选择器
-        if not overlay_mode:
+        # 普通模式下显示Y2轴选择器（直方图和重叠模式下不显示）
+        if not overlay_mode and new_chart_type != '直方图':
             y2_default = chart_config.get('y2_selected_columns', [])
             y2_selections = render_column_selector_v2(
                 "Y2轴 (右侧纵坐标)",
@@ -461,6 +593,8 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
                 'decimal_places': new_decimal_places,
                 'overlay_mode': overlay_mode,  # 保存重叠模式
                 'axis_placement': axis_placement,  # 保存轴排布策略
+                'histogram_bins': histogram_bins,  # 保存直方图分箱数
+                'hist_normalize': hist_normalize,  # 保存直方图归一化设置
                 'is_configured': True
             })
             st.success("✅ 配置已更新！")
@@ -1678,6 +1812,230 @@ def create_plotly_chart(chart_config, data, original_indices=None):
     
     return fig, config
 
+def create_plotly_histogram(chart_config, data, chart_idx):
+    """创建直方图，支持多特征叠加显示"""
+    
+    # 获取所有Y列（直方图模式下不区分Y1和Y2）
+    all_y_columns = chart_config.get('y1_columns', []) + chart_config.get('y2_columns', [])
+    
+    if len(all_y_columns) == 0:
+        return go.Figure(), {}
+    
+    # 获取配置
+    decimal_places = chart_config.get('decimal_places', 4)
+    num_bins = chart_config.get('histogram_bins', 50)
+    hist_normalize = chart_config.get('hist_normalize', False)
+    
+    # 根据小数位数生成格式字符串
+    if decimal_places == 0:
+        hover_format = ':.0f'
+    else:
+        hover_format = f':.{decimal_places}f'
+    
+    # 定义高辨识度的颜色序列
+    color_palette = [
+        '#E74C3C',  # 红色
+        '#3498DB',  # 蓝色
+        '#2ECC71',  # 绿色
+        '#F39C12',  # 橙色
+        '#9B59B6',  # 紫色
+        '#1ABC9C',  # 青色
+        '#E67E22',  # 深橙
+        '#34495E',  # 深灰蓝
+        '#E91E63',  # 粉红
+        '#00BCD4',  # 天蓝
+    ]
+    
+    # 计算透明度：多个特征时自动调整透明度
+    num_features = len([col for col in all_y_columns if col in data.columns])
+    if num_features <= 1:
+        opacity = 0.75
+    elif num_features == 2:
+        opacity = 0.6
+    elif num_features <= 4:
+        opacity = 0.5
+    elif num_features <= 6:
+        opacity = 0.4
+    else:
+        opacity = 0.35
+    
+    # 创建图表
+    fig = go.Figure()
+    
+    # 收集所有数据的范围，用于统一bin范围
+    all_data_min = float('inf')
+    all_data_max = float('-inf')
+    valid_columns = []
+    
+    for y_col in all_y_columns:
+        if y_col not in data.columns:
+            continue
+        y_data = data[y_col].dropna()
+        if len(y_data) == 0:
+            continue
+        if not pd.api.types.is_numeric_dtype(y_data):
+            continue
+        valid_columns.append(y_col)
+        all_data_min = min(all_data_min, y_data.min())
+        all_data_max = max(all_data_max, y_data.max())
+    
+    if len(valid_columns) == 0:
+        st.warning("⚠️ 没有可绘制的数值型列")
+        return go.Figure(), {}
+    
+    # 计算bin大小
+    data_range = all_data_max - all_data_min
+    if data_range == 0:
+        data_range = 1
+    bin_size = data_range / num_bins
+    
+    # 添加每个特征的直方图
+    for idx, y_col in enumerate(valid_columns):
+        color = color_palette[idx % len(color_palette)]
+        y_data = data[y_col].dropna()
+        
+        # 归一化模式
+        histnorm = 'probability density' if hist_normalize else None
+        
+        # Hover模板
+        if hist_normalize:
+            hover_template = f'<b>{y_col}</b><br>范围: %{{x}}<br>概率密度: %{{y{hover_format}}}<extra></extra>'
+        else:
+            hover_template = f'<b>{y_col}</b><br>范围: %{{x}}<br>频数: %{{y}}<extra></extra>'
+        
+        fig.add_trace(go.Histogram(
+            x=y_data,
+            name=y_col,
+            opacity=opacity,
+            marker=dict(color=color, line=dict(color='white', width=0.5)),
+            xbins=dict(
+                start=all_data_min,
+                end=all_data_max,
+                size=bin_size
+            ),
+            histnorm=histnorm,
+            hovertemplate=hover_template
+        ))
+    
+    # 多特征时使用overlay模式
+    barmode = 'overlay' if len(valid_columns) > 1 else 'relative'
+    
+    # Y轴标题
+    y_title = '概率密度' if hist_normalize else '频数'
+    
+    # 设置布局
+    fig.update_layout(
+        title={
+            'text': chart_config['title'],
+            'xanchor': 'left',
+            'x': 0
+        },
+        xaxis=dict(
+            title=dict(text='数值范围'),
+            showgrid=chart_config.get('show_grid', True),
+            showline=True,
+            zeroline=True,
+            fixedrange=False,
+            exponentformat='none',
+            separatethousands=True
+        ),
+        yaxis=dict(
+            title=dict(text=y_title),
+            showgrid=chart_config.get('show_grid', True),
+            showline=True,
+            zeroline=True,
+            fixedrange=False,
+            exponentformat='none'
+        ),
+        barmode=barmode,
+        width=chart_config.get('width', 1200),
+        height=chart_config['height'],
+        showlegend=True,
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5
+        ),
+        dragmode='zoom',
+        hovermode='x unified'
+    )
+    
+    # 配置交互选项 - 启用滚轮缩放以调整bin大小
+    config = {
+        'scrollZoom': True,
+        'displayModeBar': True,
+        'displaylogo': False,
+        'editable': True,
+        'edits': {
+            'titleText': True,
+            'axisTitleText': True,
+        }
+    }
+    
+    # 存储当前bin信息到session state，用于滚轮调整
+    st.session_state.histogram_bins[chart_idx] = num_bins
+    
+    return fig, config
+
+
+def render_histogram_bin_control(idx, chart_config):
+    """渲染直方图的bin控制组件（放在图表下方）"""
+    st.markdown("##### 🎚️ 直方图分箱控制")
+    
+    col1, col2, col3 = st.columns([2, 2, 1])
+    
+    with col1:
+        current_bins = st.session_state.histogram_bins.get(idx, chart_config.get('histogram_bins', 50))
+        new_bins = st.slider(
+            "分箱数 (Bins)",
+            min_value=5,
+            max_value=500,
+            value=current_bins,
+            step=1,
+            key=f"hist_bins_control_{idx}",
+            help="调整直方图的分箱数量，数值越大柱子越细"
+        )
+        
+        if new_bins != current_bins:
+            st.session_state.histogram_bins[idx] = new_bins
+            # 同时更新图表配置
+            st.session_state.charts[idx]['histogram_bins'] = new_bins
+            st.rerun()
+    
+    with col2:
+        # 快捷按钮
+        btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+        with btn_col1:
+            if st.button("➖", key=f"bins_dec_{idx}", help="减少分箱数"):
+                new_val = max(5, current_bins - 5)
+                st.session_state.histogram_bins[idx] = new_val
+                st.session_state.charts[idx]['histogram_bins'] = new_val
+                st.rerun()
+        with btn_col2:
+            if st.button("➕", key=f"bins_inc_{idx}", help="增加分箱数"):
+                new_val = min(500, current_bins + 5)
+                st.session_state.histogram_bins[idx] = new_val
+                st.session_state.charts[idx]['histogram_bins'] = new_val
+                st.rerun()
+        with btn_col3:
+            if st.button("½", key=f"bins_half_{idx}", help="分箱数减半"):
+                new_val = max(5, current_bins // 2)
+                st.session_state.histogram_bins[idx] = new_val
+                st.session_state.charts[idx]['histogram_bins'] = new_val
+                st.rerun()
+        with btn_col4:
+            if st.button("2×", key=f"bins_double_{idx}", help="分箱数加倍"):
+                new_val = min(500, current_bins * 2)
+                st.session_state.histogram_bins[idx] = new_val
+                st.session_state.charts[idx]['histogram_bins'] = new_val
+                st.rerun()
+    
+    with col3:
+        st.caption(f"当前: {current_bins} bins")
+
+
 # 主标题
 st.title("📊 交互式绘图工具")
 st.markdown("---")
@@ -1862,8 +2220,8 @@ def add_new_chart(position=None):
         new_idx = position + 1
     st.session_state.edit_mode[new_idx] = True  # 新图表默认打开编辑模式
     
-    # 初始化图表的范围模式
-    st.session_state.chart_range_mode[new_idx] = 'downsampled'
+    # 初始化图表的范围模式（根据数据源决定，大文件默认降采样，否则默认原始数据）
+    # 注意：此时可能还没有选择数据源，所以先不初始化，等选择数据源后再初始化
     st.session_state.chart_range_selection[new_idx] = None
 
 # 渲染单个图表区域
@@ -1927,145 +2285,65 @@ def render_chart_area(idx, chart_config):
                     ch2 = y2_selections.get('list_columns', {}).get(list_col, [])
                     all_selections['list_columns'][list_col] = list(set(ch1 + ch2))
                 
-                # 大文件处理：显示模式切换控件
-                if is_large_file:
-                    st.markdown("##### 🔍 大文件显示模式")
+                # 原始数据模式下的范围选择（仅在大文件且选择原始数据模式时显示）
+                current_display_mode = st.session_state.chart_range_mode.get(idx, 'original')
+                if is_large_file and current_display_mode == 'original' and not st.session_state.chart_data_ready.get(idx, True):
+                    st.markdown("##### 📍 选择数据范围")
                     
-                    # 降采样倍数设置
-                    ratio_col, info_ratio_col = st.columns([1, 3])
-                    with ratio_col:
-                        new_ratio = st.number_input(
-                            "降采样倍数",
-                            min_value=10,
-                            max_value=1000,
-                            value=st.session_state.downsample_ratio,
-                            step=10,
-                            key=f"downsample_ratio_chart_{idx}",
-                            help="原始数据行数除以此倍数得到降采样后的点数"
-                        )
-                        if new_ratio != st.session_state.downsample_ratio:
-                            st.session_state.downsample_ratio = new_ratio
-                            st.rerun()
-                    with info_ratio_col:
-                        current_points = max(1000, len(original_data) // st.session_state.downsample_ratio)
-                        st.caption(f"💡 当前设置：{len(original_data):,}行 ÷ {st.session_state.downsample_ratio} = 约{current_points:,}点")
+                    # 三向联动：降采样图行号 ↔ 原始数据行号 ↔ 百分比
+                    st.caption("💡 从降采样图的hover中读取行索引，或直接填写百分比/原始行号，三者自动联动")
                     
-                    # 初始化该图表的范围模式
-                    if idx not in st.session_state.chart_range_mode:
-                        st.session_state.chart_range_mode[idx] = 'downsampled'
-                        st.session_state.chart_data_ready[idx] = True  # 降采样模式默认准备好
-                    
-                    mode_col, info_col = st.columns([2, 3])
-                    
-                    with mode_col:
-                        current_mode = st.session_state.chart_range_mode[idx]
-                        # 动态计算显示的降采样点数
-                        estimated_points = max(1000, len(original_data) // st.session_state.downsample_ratio)
-                        mode_options = {
-                            'downsampled': f'📉 降采样预览 ({st.session_state.downsample_ratio}x, 约{estimated_points:,}点)',
-                            'original': '📊 原始数据'
-                        }
+                    x_col = chart_config.get('x_column')
+                    if x_col and x_col in original_data.columns:
+                        total_rows = len(original_data)
+                        downsampled_rows = max(1000, total_rows // st.session_state.downsample_ratio)
                         
-                        selected_mode = st.radio(
-                            "选择显示模式",
-                            options=list(mode_options.keys()),
-                            format_func=lambda x: mode_options[x],
-                            index=0 if current_mode == 'downsampled' else 1,
-                            key=f"display_mode_{idx}",
-                            horizontal=True
-                        )
-                        
-                        if selected_mode != current_mode:
-                            st.session_state.chart_range_mode[idx] = selected_mode
-                            
-                            # 切换到原始数据模式时的处理
-                            if selected_mode == 'original':
-                                # 标记为未准备好绘图（需要用户确认）
-                                st.session_state.chart_data_ready[idx] = False
-                                
-                                # 如果还没有设置范围，使用默认值（中间20%）
-                                if idx not in st.session_state.chart_range_selection or st.session_state.chart_range_selection[idx] is None:
-                                    x_col = chart_config.get('x_column')
-                                    if x_col and x_col in original_data.columns:
-                                        is_numeric_x = pd.api.types.is_numeric_dtype(original_data[x_col])
-                                        total_rows = len(original_data)
-                                        
-                                        if is_numeric_x:
-                                            # 数值型X轴：取中间20%范围
-                                            x_min = float(original_data[x_col].min())
-                                            x_max = float(original_data[x_col].max())
-                                            x_range = x_max - x_min
-                                            range_start = x_min + x_range * 0.4
-                                            range_end = x_min + x_range * 0.6
-                                        else:
-                                            # 非数值型X轴：取中间20%行
-                                            range_start = int(total_rows * 0.4)
-                                            range_end = int(total_rows * 0.6)
-                                        
-                                        st.session_state.chart_range_selection[idx] = (range_start, range_end)
+                        # 如果还没有设置范围，使用默认值（中间20%）
+                        if idx not in st.session_state.chart_range_selection or st.session_state.chart_range_selection[idx] is None:
+                            is_numeric_x = pd.api.types.is_numeric_dtype(original_data[x_col])
+                            if is_numeric_x:
+                                x_min = float(original_data[x_col].min())
+                                x_max = float(original_data[x_col].max())
+                                x_range = x_max - x_min
+                                range_start = x_min + x_range * 0.4
+                                range_end = x_min + x_range * 0.6
                             else:
-                                # 切换回降采样模式，自动准备好
-                                st.session_state.chart_data_ready[idx] = True
-                            
-                            st.rerun()
-                    
-                    with info_col:
-                        if selected_mode == 'downsampled':
-                            st.info(f"💡 当前显示降采样后的全局预览数据 (原始数据: {len(original_data):,} 行)")
-                        else:
-                            st.info(f"💡 当前显示原始颗粒度数据")
-                    
-                    # 原始数据模式：范围选择
-                    if selected_mode == 'original':
-                        st.markdown("**📍 选择数据范围**")
+                                range_start = int(total_rows * 0.4)
+                                range_end = int(total_rows * 0.6)
+                            st.session_state.chart_range_selection[idx] = (range_start, range_end)
                         
-                        # 三向联动：降采样图行号 ↔ 原始数据行号 ↔ 百分比
-                        st.markdown("**📊 范围选择（三向联动）**")
-                        st.caption("💡 从降采样图的hover中读取行索引，或直接填写百分比/原始行号，三者自动联动")
-                        
-                        x_col = chart_config.get('x_column')
-                        if x_col and x_col in original_data.columns:
-                            total_rows = len(original_data)
-                            downsampled_rows = max(1000, total_rows // st.session_state.downsample_ratio)
-                            
-                            # 使用 fragment 渲染输入控件，使输入变化只刷新输入部分，不影响图表
-                            render_range_input_controls(idx, total_rows, downsampled_rows, x_col, original_data)
-                        
-                        st.markdown("---")
-                        
-                        # 绘制按钮（放在 fragment 外面，确保点击时触发整个页面刷新）
-                        col_btn1, col_btn2 = st.columns([1, 3])
-                        with col_btn1:
-                            if st.button("🎨 绘制原始数据图表", key=f"draw_original_{idx}", type="primary", use_container_width=True):
-                                # 将当前选择的范围保存为确认范围
-                                st.session_state.confirmed_chart_range[idx] = st.session_state.chart_range_selection.get(idx)
-                                st.session_state.chart_data_ready[idx] = True
-                                st.rerun()
-                        with col_btn2:
-                            st.caption("💡 点击按钮后将加载并绘制选定范围的原始数据")
+                        # 使用 fragment 渲染输入控件
+                        render_range_input_controls(idx, total_rows, downsampled_rows, x_col, original_data)
                     
                     st.markdown("---")
+                    
+                    # 绘制按钮
+                    col_btn1, col_btn2 = st.columns([1, 3])
+                    with col_btn1:
+                        if st.button("🎨 绘制原始数据图表", key=f"draw_original_{idx}", type="primary", use_container_width=True):
+                            st.session_state.confirmed_chart_range[idx] = st.session_state.chart_range_selection.get(idx)
+                            st.session_state.chart_data_ready[idx] = True
+                            st.rerun()
+                    with col_btn2:
+                        st.caption("💡 点击按钮后将加载并绘制选定范围的原始数据")
+                    
+                    st.markdown("---")
+                    st.info("💡 下方仍显示降采样预览图，配置好范围后点击「绘制原始数据图表」按钮查看精确数据")
                 
                 # 确定应该显示哪种数据
                 show_downsampled = False  # 是否显示降采样数据
                 show_original = False     # 是否显示原始数据
-                show_config_only = False  # 是否只显示配置界面
                 
-                if is_large_file:
-                    if st.session_state.chart_range_mode.get(idx) == 'downsampled':
-                        # 降采样模式：显示降采样数据
+                if current_display_mode == 'downsampled':
+                    # 降采样模式：显示降采样数据
+                    show_downsampled = True
+                else:  # 原始数据模式
+                    if st.session_state.chart_data_ready.get(idx, True):
+                        # 已准备好：显示原始数据
+                        show_original = True
+                    else:
+                        # 大文件未确认范围：继续显示降采样图
                         show_downsampled = True
-                    else:  # 原始数据模式
-                        if st.session_state.chart_data_ready.get(idx, False):
-                            # 已确认绘制：显示原始数据
-                            show_original = True
-                        else:
-                            # 未确认绘制：继续显示降采样图 + 配置界面
-                            show_downsampled = True
-                            st.info("💡 下方仍显示降采样预览图，配置好范围后点击「绘制原始数据图表」按钮查看精确数据")
-                else:
-                    # 非大文件：直接显示数据
-                    show_original = True
                 
                 if not show_downsampled and not show_original:
                     # 不应该发生，但作为安全措施
@@ -2126,7 +2404,10 @@ def render_chart_area(idx, chart_config):
                                 st.rerun()
                     
                     # 创建图表（根据模式选择函数）
-                    if chart_config.get('overlay_mode', False):
+                    if chart_config.get('chart_type') == '直方图':
+                        # 直方图模式
+                        fig, config = create_plotly_histogram(chart_config, plot_data, idx)
+                    elif chart_config.get('overlay_mode', False):
                         # 重叠模式
                         fig, config = create_plotly_chart_overlay(chart_config, plot_data, original_indices)
                     else:
@@ -2134,7 +2415,10 @@ def render_chart_area(idx, chart_config):
                         fig, config = create_plotly_chart(chart_config, plot_data, original_indices)
                     
                     # 提示信息
-                    if chart_config.get('overlay_mode', False):
+                    if chart_config.get('chart_type') == '直方图':
+                        # 直方图的提示
+                        st.caption("💡 直方图提示：可框选区域放大；使用下方滑块或快捷按钮调整分箱数；多个特征会叠加显示并自动调整透明度。")
+                    elif chart_config.get('overlay_mode', False):
                         # 重叠模式的提示
                         st.caption("💡 重叠模式提示：每条曲线使用独立的Y轴刻度（颜色关联）；可框选区域放大；鼠标悬停在Y轴上滚动滚轮可缩放该轴；双击Y轴自动适配；点击图例可隐藏/显示对应曲线。")
                     elif show_downsampled and is_large_file:
@@ -2147,6 +2431,10 @@ def render_chart_area(idx, chart_config):
                     
                     # 显示图表
                     st.plotly_chart(fig, use_container_width=False, config=config, key=f"chart_{idx}")
+                    
+                    # 直方图的bin控制组件（放在图表下方）
+                    if chart_config.get('chart_type') == '直方图':
+                        render_histogram_bin_control(idx, chart_config)
             except Exception as e:
                 st.error(f"绘制图表出错: {str(e)}")
                 import traceback
@@ -2216,7 +2504,8 @@ else:
     ### 功能特点
     - ✅ 支持CSV和Excel文件格式
     - ✅ **多文件支持**：可同时加载多个数据文件，每个图表独立选择数据源
-    - ✅ **🎨 重叠模式（新）**：多特征共享X轴，每个特征独立Y轴，颜色强关联（曲线-轴-图例同色）
+    - ✅ **📊 直方图功能（新）**：支持多特征叠加显示，自动调节透明度，可动态调整分箱数
+    - ✅ **🎨 重叠模式**：多特征共享X轴，每个特征独立Y轴，颜色强关联（曲线-轴-图例同色）
     - ✅ **Y轴智能排布**：支持左右交替或左侧堆叠两种布局，避免轴标签重叠
     - ✅ **大文件智能优化**：超过50万行数据自动启用降采样，快速预览整体曲线
     - ✅ **双模式显示**：大文件支持降采样预览和原始数据精细查看两种模式
@@ -2292,6 +2581,37 @@ else:
     - 双击Y轴自动适配该曲线到合适范围
     - 双击图表区域重置所有视图
     
+    ### 📊 直方图功能
+    直方图用于展示数据的分布情况，支持多个特征的叠加对比。
+    
+    **核心特性：**
+    - **多特征叠加**：可以同时绘制多个特征的直方图，便于对比分布差异
+    - **智能透明度**：根据特征数量自动调整柱子透明度，确保重叠部分清晰可见
+    - **动态分箱控制**：通过滑块或快捷按钮实时调整分箱数（Bins）
+    - **统一范围**：多个特征使用统一的数据范围，便于直观对比
+    - **归一化显示**：可选择显示频数或概率密度
+    - **列表列支持**：完全支持列表列的通道选择功能
+    
+    **使用方法：**
+    1. 在图表类型中选择「直方图」
+    2. 设置初始分箱数（可选）
+    3. 选择是否归一化显示
+    4. 在「Y轴特征」中选择要分析的一个或多个特征
+    5. 点击「✅ 应用修改」查看直方图
+    6. 使用图表下方的控制组件实时调整分箱数
+    
+    **分箱控制：**
+    - **滑块**：拖动滑块精确调整分箱数（5-500）
+    - **➖ / ➕**：每次增减5个分箱
+    - **½**：分箱数减半（柱子变粗）
+    - **2×**：分箱数加倍（柱子变细）
+    
+    **适用场景：**
+    - ✅ 数据分布分析（正态、偏态、双峰等）
+    - ✅ 异常值检测（查看数据尾部分布）
+    - ✅ 多特征分布对比
+    - ✅ 数据质量检查（查看数据集中度）
+    
     ### 图表管理
     - **编辑模式**: 点击「⚙️ 编辑属性」打开面板，点击「⚙️ 收起属性」隐藏面板
     - **删除图表**: 点击「🗑️ 删除该图」删除单个图表
@@ -2362,7 +2682,7 @@ else:
 # 页脚
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: gray;'>交互式绘图工具 v2.2 (重叠模式 + 多Y轴独立刻度) | Developer: yinmingxin</div>",
+    "<div style='text-align: center; color: gray;'>交互式绘图工具 v2.3 (直方图 + 重叠模式 + 多Y轴独立刻度) | Developer: yinmingxin</div>",
     unsafe_allow_html=True
 )
 
