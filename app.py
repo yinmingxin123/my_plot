@@ -8,7 +8,126 @@ import numpy as np
 
 st.set_page_config(page_title="绘图小工具-by YMX", layout="wide")
 
-# 大文件阈值配置
+# ============ 时间戳智能识别与转换 ============
+
+def detect_timestamp_type(series):
+    """
+    智能检测数据是否为时间戳
+    
+    Returns:
+        None: 不是时间戳
+        '10digit': 10位秒级时间戳
+        '13digit': 13位毫秒级时间戳
+        'datetime': 已经是datetime类型或日期时间字符串
+    """
+    # 取非空值
+    valid_values = series.dropna()
+    if len(valid_values) == 0:
+        return None
+    
+    # 检查是否已经是datetime类型
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return 'datetime'
+    
+    # 检查是否为日期时间字符串（如 "2025-11-05 01:22:36"）
+    if pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series):
+        sample = valid_values.head(20)
+        datetime_count = 0
+        for val in sample:
+            if isinstance(val, str):
+                # 尝试匹配常见的日期时间格式
+                import re
+                # 匹配 YYYY-MM-DD HH:MM:SS 或 YYYY/MM/DD HH:MM:SS 等格式
+                if re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}(\s+\d{1,2}:\d{2}(:\d{2})?)?', val):
+                    datetime_count += 1
+        if datetime_count / len(sample) > 0.8:
+            return 'datetime'
+    
+    # 数值类型的时间戳检测
+    if not pd.api.types.is_numeric_dtype(series):
+        return None
+    
+    # 检查数值范围
+    min_val = valid_values.min()
+    max_val = valid_values.max()
+    
+    # 检查是否为13位时间戳（毫秒级）
+    # 合理范围：2000年到2100年，即 946684800000 到 4102444800000
+    if min_val >= 946684800000 and max_val <= 4102444800000:
+        # 进一步检查：大部分值应该是13位
+        sample = valid_values.head(100)
+        digit_counts = sample.apply(lambda x: len(str(int(x))))
+        if (digit_counts == 13).mean() > 0.8:
+            return '13digit'
+    
+    # 检查是否为10位时间戳（秒级）
+    # 合理范围：2000年到2100年，即 946684800 到 4102444800
+    if min_val >= 946684800 and max_val <= 4102444800:
+        # 进一步检查：大部分值应该是10位
+        sample = valid_values.head(100)
+        digit_counts = sample.apply(lambda x: len(str(int(x))))
+        if (digit_counts == 10).mean() > 0.8:
+            return '10digit'
+    
+    return None
+
+def convert_timestamp_to_beijing_time(series, ts_type):
+    """
+    将时间戳转换为北京时间 datetime
+    
+    Args:
+        series: pandas Series，时间戳数据
+        ts_type: '10digit' 或 '13digit'
+    
+    Returns:
+        pandas Series，datetime 类型（北京时间）
+    """
+    if ts_type == '13digit':
+        # 毫秒级时间戳
+        dt_series = pd.to_datetime(series, unit='ms', utc=True)
+    elif ts_type == '10digit':
+        # 秒级时间戳
+        dt_series = pd.to_datetime(series, unit='s', utc=True)
+    else:
+        return series
+    
+    # 转换为北京时间 (UTC+8)
+    dt_series = dt_series.dt.tz_convert('Asia/Shanghai')
+    
+    # 移除时区信息（Plotly 更好处理 naive datetime）
+    dt_series = dt_series.dt.tz_localize(None)
+    
+    return dt_series
+
+def get_timestamp_format(ts_type):
+    """
+    根据时间戳类型返回 Plotly 的格式字符串
+    
+    Args:
+        ts_type: '10digit', '13digit' 或 'datetime'
+    
+    Returns:
+        tuple: (tickformat, hoverformat)
+    """
+    if ts_type == '13digit':
+        # 13位毫秒级：显示到毫秒
+        tickformat = '%Y-%m-%d %H:%M:%S'
+        hoverformat = '%Y-%m-%d %H:%M:%S.%L'
+    elif ts_type == '10digit':
+        # 10位秒级：显示到秒
+        tickformat = '%Y-%m-%d %H:%M:%S'
+        hoverformat = '%Y-%m-%d %H:%M:%S'
+    elif ts_type == 'datetime':
+        # 已经是datetime类型或日期时间字符串
+        tickformat = '%Y-%m-%d %H:%M:%S'
+        hoverformat = '%Y-%m-%d %H:%M:%S'
+    else:
+        tickformat = None
+        hoverformat = None
+    
+    return tickformat, hoverformat
+
+# ============ 大文件阈值配置 ============
 LARGE_FILE_THRESHOLD = 500000  # 超过50万行视为大文件
 DOWNSAMPLE_TARGET_POINTS = 10000  # 降采样目标点数
 
@@ -1317,6 +1436,23 @@ def create_plotly_chart_overlay(chart_config, data, original_indices=None):
         # 没有Y列，返回空图
         return go.Figure(), {}
     
+    # 复制数据以避免修改原始数据
+    data = data.copy()
+    
+    # 智能检测X轴是否为时间戳，并转换为北京时间
+    x_column = chart_config['x_column']
+    ts_type = None
+    x_tickformat = None
+    x_hoverformat = ',.0f'  # 默认格式
+    
+    if x_column in data.columns:
+        ts_type = detect_timestamp_type(data[x_column])
+        if ts_type:
+            # 只有数值时间戳才需要转换为北京时间
+            if ts_type in ('10digit', '13digit'):
+                data[x_column] = convert_timestamp_to_beijing_time(data[x_column], ts_type)
+            x_tickformat, x_hoverformat = get_timestamp_format(ts_type)
+    
     # 获取配置
     decimal_places = chart_config.get('decimal_places', 4)
     if decimal_places == 0:
@@ -1495,15 +1631,19 @@ def create_plotly_chart_overlay(chart_config, data, original_indices=None):
     
     # 配置X轴
     xaxis_config = {
-        'title': {'text': chart_config['x_column']},
+        'title': {'text': chart_config['x_column'] + (' (北京时间)' if ts_type else '')},
         'showgrid': chart_config.get('show_grid', True),
         'showline': True,
         'zeroline': True,
         'fixedrange': False,
         'exponentformat': 'none',
         'separatethousands': True,
+        'hoverformat': x_hoverformat,  # 时间戳用日期格式，否则用数字格式
         'domain': [domain_left, domain_right]  # 动态计算的作图区域
     }
+    # 如果是时间戳，添加 tickformat
+    if x_tickformat:
+        xaxis_config['tickformat'] = x_tickformat
     
     # 配置所有Y轴（设置空title避免"click to enter"提示）
     layout_update = {'xaxis': xaxis_config}
@@ -1616,6 +1756,23 @@ def create_plotly_chart_overlay(chart_config, data, original_indices=None):
 
 def create_plotly_chart(chart_config, data, original_indices=None):
     """根据配置创建Plotly图表"""
+    
+    # 复制数据以避免修改原始数据
+    data = data.copy()
+    
+    # 智能检测X轴是否为时间戳，并转换为北京时间
+    x_column = chart_config['x_column']
+    ts_type = None
+    x_tickformat = None
+    x_hoverformat = ',.0f'  # 默认格式
+    
+    if x_column in data.columns:
+        ts_type = detect_timestamp_type(data[x_column])
+        if ts_type:
+            # 只有数值时间戳才需要转换为北京时间
+            if ts_type in ('10digit', '13digit'):
+                data[x_column] = convert_timestamp_to_beijing_time(data[x_column], ts_type)
+            x_tickformat, x_hoverformat = get_timestamp_format(ts_type)
     
     # 判断是否有双y轴
     y1_columns = chart_config.get('y1_columns', [])
@@ -1737,23 +1894,29 @@ def create_plotly_chart(chart_config, data, original_indices=None):
     y1_title = y1_columns[0] if len(y1_columns) > 0 else 'Y1轴'
     
     # 设置布局
+    xaxis_config = {
+        'title': {
+            'text': chart_config['x_column'] + (' (北京时间)' if ts_type else '')
+        },
+        'showgrid': chart_config['show_grid'],
+        'showline': True,
+        'zeroline': True,
+        'fixedrange': False,
+        'exponentformat': 'none',  # 不使用科学计数法
+        'separatethousands': True,  # 千位分隔符
+        'hoverformat': x_hoverformat  # 时间戳用日期格式，否则用数字格式
+    }
+    # 如果是时间戳，添加 tickformat
+    if x_tickformat:
+        xaxis_config['tickformat'] = x_tickformat
+    
     layout_config = {
         'title': {
             'text': chart_config['title'],
             'xanchor': 'left',
             'x': 0
         },
-        'xaxis': {
-            'title': {
-                'text': chart_config['x_column']
-            },
-            'showgrid': chart_config['show_grid'],
-            'showline': True,
-            'zeroline': True,
-            'fixedrange': False,
-            'exponentformat': 'none',  # 不使用科学计数法
-            'separatethousands': True   # 千位分隔符
-        },
+        'xaxis': xaxis_config,
         'yaxis': {
             'title': {
                 'text': y1_title
@@ -1937,7 +2100,8 @@ def create_plotly_histogram(chart_config, data, chart_idx):
             zeroline=True,
             fixedrange=False,
             exponentformat='none',
-            separatethousands=True
+            separatethousands=True,
+            hoverformat=',.0f'  # hover时完整显示整数
         ),
         yaxis=dict(
             title=dict(text=y_title),
