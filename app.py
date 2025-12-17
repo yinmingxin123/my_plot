@@ -18,8 +18,11 @@ def detect_timestamp_type(series):
         None: 不是时间戳
         '10digit': 10位秒级时间戳
         '13digit': 13位毫秒级时间戳
-        'datetime': 已经是datetime类型或日期时间字符串
+        'datetime': 已经是datetime类型或日期时间字符串（不含毫秒）
+        'datetime_ms': 日期时间字符串（含毫秒，如 2025-12-11 11:03:55.006）
     """
+    import re
+    
     # 取非空值
     valid_values = series.dropna()
     if len(valid_values) == 0:
@@ -29,18 +32,24 @@ def detect_timestamp_type(series):
     if pd.api.types.is_datetime64_any_dtype(series):
         return 'datetime'
     
-    # 检查是否为日期时间字符串（如 "2025-11-05 01:22:36"）
+    # 检查是否为日期时间字符串
     if pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series):
         sample = valid_values.head(20)
         datetime_count = 0
+        datetime_ms_count = 0
         for val in sample:
             if isinstance(val, str):
-                # 尝试匹配常见的日期时间格式
-                import re
-                # 匹配 YYYY-MM-DD HH:MM:SS 或 YYYY/MM/DD HH:MM:SS 等格式
-                if re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}(\s+\d{1,2}:\d{2}(:\d{2})?)?', val):
+                # 匹配带毫秒的格式：YYYY-MM-DD HH:MM:SS.mmm
+                if re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2}\.\d+', val):
+                    datetime_ms_count += 1
+                    datetime_count += 1
+                # 匹配不带毫秒的格式：YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD
+                elif re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}(\s+\d{1,2}:\d{2}(:\d{2})?)?$', val):
                     datetime_count += 1
         if datetime_count / len(sample) > 0.8:
+            # 如果大部分包含毫秒，返回 datetime_ms
+            if datetime_ms_count / len(sample) > 0.8:
+                return 'datetime_ms'
             return 'datetime'
     
     # 数值类型的时间戳检测
@@ -104,7 +113,7 @@ def get_timestamp_format(ts_type):
     根据时间戳类型返回 Plotly 的格式字符串
     
     Args:
-        ts_type: '10digit', '13digit' 或 'datetime'
+        ts_type: '10digit', '13digit', 'datetime' 或 'datetime_ms'
     
     Returns:
         tuple: (tickformat, hoverformat)
@@ -117,8 +126,12 @@ def get_timestamp_format(ts_type):
         # 10位秒级：显示到秒
         tickformat = '%Y-%m-%d %H:%M:%S'
         hoverformat = '%Y-%m-%d %H:%M:%S'
+    elif ts_type == 'datetime_ms':
+        # 带毫秒的日期时间字符串
+        tickformat = '%Y-%m-%d %H:%M:%S'
+        hoverformat = '%Y-%m-%d %H:%M:%S.%L'
     elif ts_type == 'datetime':
-        # 已经是datetime类型或日期时间字符串
+        # 不带毫秒的日期时间字符串
         tickformat = '%Y-%m-%d %H:%M:%S'
         hoverformat = '%Y-%m-%d %H:%M:%S'
     else:
@@ -383,27 +396,47 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
             help="选择该图表使用的数据文件"
         )
         
-        # 如果数据源改变，更新图表配置并重置列选择
+        # 如果数据源改变，更新图表配置
         if new_data_source != chart_config.get('data_source'):
-            # 更新图表配置
-            chart_config['data_source'] = new_data_source
-            chart_config['y1_columns'] = []
-            chart_config['y2_columns'] = []
-            chart_config['y1_selections'] = {'normal': [], 'list_columns': {}}
-            chart_config['y2_selections'] = {'normal': [], 'list_columns': {}}
-            chart_config['y1_selected_columns'] = []
-            chart_config['y2_selected_columns'] = []
-            chart_config['is_configured'] = False
+            old_data_source = chart_config.get('data_source')
             
-            # 重置X轴为新数据源的第一列
+            # 获取新旧数据源的列名
+            old_columns = set()
+            new_columns = set()
+            if old_data_source and old_data_source in st.session_state.files_data:
+                old_columns = set(st.session_state.files_data[old_data_source]['data'].columns.tolist())
             if new_data_source and new_data_source in st.session_state.files_data:
                 new_data = st.session_state.files_data[new_data_source]['data']
-                chart_config['x_column'] = new_data.columns[0] if len(new_data.columns) > 0 else ''
+                new_columns = set(new_data.columns.tolist())
             
-            # 清理该图表的所有相关状态
-            clear_chart_states(idx)
+            # 更新数据源
+            chart_config['data_source'] = new_data_source
             
-            st.warning(f"⚠️ 数据源已切换到 '{new_data_source}'，列选择已重置")
+            # 检查列名是否完全相同
+            if old_columns == new_columns and len(old_columns) > 0:
+                # 列名相同，保留之前的选择，只更新数据源
+                # 清理该图表的缓存状态（但保留列选择）
+                clear_chart_states(idx, preserve_column_selections=True)
+                st.success(f"✅ 数据源已切换到 '{new_data_source}'，列名相同，已保留特征选择")
+            else:
+                # 列名不同，重置所有列选择
+                chart_config['y1_columns'] = []
+                chart_config['y2_columns'] = []
+                chart_config['y1_selections'] = {'normal': [], 'list_columns': {}}
+                chart_config['y2_selections'] = {'normal': [], 'list_columns': {}}
+                chart_config['y1_selected_columns'] = []
+                chart_config['y2_selected_columns'] = []
+                chart_config['is_configured'] = False
+                
+                # 重置X轴为新数据源的第一列
+                if new_data_source and new_data_source in st.session_state.files_data:
+                    chart_config['x_column'] = new_data.columns[0] if len(new_data.columns) > 0 else ''
+                
+                # 清理该图表的所有相关状态
+                clear_chart_states(idx)
+                
+                st.warning(f"⚠️ 数据源已切换到 '{new_data_source}'，列名不同，列选择已重置")
+            
             st.rerun(scope="app")  # 数据源改变需要刷新整个页面
     
     # 检查是否选择了数据源
@@ -1071,25 +1104,36 @@ def expand_list_column_lazy(df, col_name, channel_indices=None, data_source=None
 
     return pd.DataFrame(result_dict)
 
-def clear_chart_states(chart_idx):
+def clear_chart_states(chart_idx, preserve_column_selections=False):
     """
     清理指定图表的所有相关session state
     
     Args:
         chart_idx: 图表索引
+        preserve_column_selections: 是否保留列选择状态（切换数据源但列名相同时使用）
     """
     # 清理该图表的所有相关状态（列选择、widget状态等）
-    keys_to_delete = [key for key in list(st.session_state.keys()) 
-                     if key.startswith(f'y1_{chart_idx}_') or 
-                        key.startswith(f'y2_{chart_idx}_') or
-                        key.startswith(f'x_{chart_idx}') or
-                        key.startswith(f'title_{chart_idx}') or
-                        key.startswith(f'type_{chart_idx}') or
-                        key.startswith(f'grid_{chart_idx}') or
-                        key.startswith(f'width_{chart_idx}') or
-                        key.startswith(f'height_{chart_idx}') or
-                        key.startswith(f'decimal_{chart_idx}') or
-                        key.startswith(f'data_source_{chart_idx}')]
+    keys_to_delete = []
+    for key in list(st.session_state.keys()):
+        # 检查是否是该图表的状态key
+        if (key.startswith(f'y1_{chart_idx}_') or 
+            key.startswith(f'y2_{chart_idx}_') or
+            key.startswith(f'x_{chart_idx}') or
+            key.startswith(f'title_{chart_idx}') or
+            key.startswith(f'type_{chart_idx}') or
+            key.startswith(f'grid_{chart_idx}') or
+            key.startswith(f'width_{chart_idx}') or
+            key.startswith(f'height_{chart_idx}') or
+            key.startswith(f'decimal_{chart_idx}') or
+            key.startswith(f'data_source_{chart_idx}')):
+            
+            # 如果需要保留列选择状态，跳过 y1_ 和 y2_ 开头的所有 key（包括 checkbox 的 key）
+            if preserve_column_selections:
+                if key.startswith(f'y1_{chart_idx}_') or key.startswith(f'y2_{chart_idx}_'):
+                    continue
+            
+            keys_to_delete.append(key)
+    
     for key in keys_to_delete:
         if key in st.session_state:
             del st.session_state[key]
