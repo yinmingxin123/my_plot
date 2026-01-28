@@ -16,7 +16,8 @@ def detect_timestamp_type(series):
     
     Returns:
         None: 不是时间戳
-        '10digit': 10位秒级时间戳
+        '10digit': 10位秒级时间戳（无小数）
+        '10digit_ms': 10位秒级时间戳带小数毫秒（如 1769414643.403）
         '13digit': 13位毫秒级时间戳
         'datetime': 已经是datetime类型或日期时间字符串（不含毫秒）
         'datetime_ms': 日期时间字符串（含毫秒，如 2025-12-11 11:03:55.006）
@@ -76,6 +77,10 @@ def detect_timestamp_type(series):
         sample = valid_values.head(100)
         digit_counts = sample.apply(lambda x: len(str(int(x))))
         if (digit_counts == 10).mean() > 0.8:
+            # 检查是否带小数毫秒部分
+            has_decimal = sample.apply(lambda x: x != int(x)).mean() > 0.5
+            if has_decimal:
+                return '10digit_ms'
             return '10digit'
     
     return None
@@ -86,7 +91,7 @@ def convert_timestamp_to_beijing_time(series, ts_type):
     
     Args:
         series: pandas Series，时间戳数据
-        ts_type: '10digit' 或 '13digit'
+        ts_type: '10digit', '10digit_ms' 或 '13digit'
     
     Returns:
         pandas Series，datetime 类型（北京时间）
@@ -94,8 +99,9 @@ def convert_timestamp_to_beijing_time(series, ts_type):
     if ts_type == '13digit':
         # 毫秒级时间戳
         dt_series = pd.to_datetime(series, unit='ms', utc=True)
-    elif ts_type == '10digit':
-        # 秒级时间戳
+    elif ts_type in ('10digit', '10digit_ms'):
+        # 秒级时间戳（可能带小数毫秒）
+        # pd.to_datetime(unit='s') 会正确处理浮点数的小数部分作为亚秒
         dt_series = pd.to_datetime(series, unit='s', utc=True)
     else:
         return series
@@ -113,7 +119,7 @@ def get_timestamp_format(ts_type):
     根据时间戳类型返回 Plotly 的格式字符串
     
     Args:
-        ts_type: '10digit', '13digit', 'datetime' 或 'datetime_ms'
+        ts_type: '10digit', '10digit_ms', '13digit', 'datetime' 或 'datetime_ms'
     
     Returns:
         tuple: (tickformat, hoverformat)
@@ -122,8 +128,12 @@ def get_timestamp_format(ts_type):
         # 13位毫秒级：显示到毫秒
         tickformat = '%Y-%m-%d %H:%M:%S'
         hoverformat = '%Y-%m-%d %H:%M:%S.%L'
+    elif ts_type == '10digit_ms':
+        # 10位秒级带小数毫秒：显示到毫秒
+        tickformat = '%Y-%m-%d %H:%M:%S'
+        hoverformat = '%Y-%m-%d %H:%M:%S.%L'
     elif ts_type == '10digit':
-        # 10位秒级：显示到秒
+        # 10位秒级（无小数）：显示到秒
         tickformat = '%Y-%m-%d %H:%M:%S'
         hoverformat = '%Y-%m-%d %H:%M:%S'
     elif ts_type == 'datetime_ms':
@@ -612,15 +622,38 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
         
         # 直方图模式下不需要选择X轴
         if new_chart_type != '直方图':
-            new_x_column = st.selectbox(
-                "X轴 (横坐标)", 
-                columns,
-                index=columns.index(chart_config['x_column']) if chart_config['x_column'] in columns else 0,
-                key=f"x_{idx}"
+            # 使用索引作为X轴的选项
+            use_index_as_x = st.checkbox(
+                "使用索引作为X轴 (0, 1, 2, ...)",
+                value=chart_config.get('use_index_as_x', False),
+                key=f"use_index_as_x_{idx}",
+                help="勾选后将使用数据行的索引（0, 1, 2, ..., n-1）作为横坐标，而不是选择某一列"
             )
+            
+            # 只有不使用索引时才显示X轴列选择器
+            if not use_index_as_x:
+                new_x_column = st.selectbox(
+                    "X轴 (横坐标)", 
+                    columns,
+                    index=columns.index(chart_config['x_column']) if chart_config['x_column'] in columns else 0,
+                    key=f"x_{idx}"
+                )
+                # 按X轴排序选项
+                sort_by_x = st.checkbox(
+                    "按X轴排序",
+                    value=chart_config.get('sort_by_x', False),
+                    key=f"sort_by_x_{idx}",
+                    help="勾选后将按X轴值升序排列数据"
+                )
+            else:
+                # 使用索引时，x_column保持默认值但不影响绘图
+                new_x_column = chart_config.get('x_column', columns[0] if columns else '')
+                sort_by_x = False
         else:
             # 直方图模式下使用默认的第一列作为X轴（实际不会用到）
             new_x_column = chart_config.get('x_column', columns[0] if columns else '')
+            sort_by_x = False
+            use_index_as_x = False  # 直方图模式不使用索引选项
         
         # 根据模式显示不同的Y轴选择器
         if new_chart_type == '直方图':
@@ -733,6 +766,8 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
                 'chart_type': new_chart_type,
                 'data_source': data_source,  # 保存数据源
                 'x_column': new_x_column,
+                'use_index_as_x': use_index_as_x,  # 是否使用索引作为X轴
+                'sort_by_x': sort_by_x,  # 是否按X轴排序
                 'y1_columns': y1_column_names,  # 实际列名
                 'y2_columns': y2_column_names,  # 实际列名
                 'y1_selections': y1_selections,  # 保存选择状态
@@ -1142,9 +1177,23 @@ def load_data(uploaded_file, downsample_ratio=100):
     """加载CSV或Excel文件（不立即展开列表列）"""
     try:
         if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(uploaded_file)
+            # 尝试多种编码读取CSV
+            df = None
+            encodings = ['utf-8', 'gbk', 'gb2312', 'utf-8-sig', 'latin-1']
+            for encoding in encodings:
+                try:
+                    uploaded_file.seek(0)  # 重置文件指针
+                    df = pd.read_csv(uploaded_file, encoding=encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if df is None:
+                st.error("无法识别文件编码，请检查文件格式")
+                return None, None, False, None
+        elif uploaded_file.name.endswith('.xlsx'):
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        elif uploaded_file.name.endswith('.xls'):
+            df = pd.read_excel(uploaded_file, engine='xlrd')
         else:
             st.error("不支持的文件格式，请上传CSV或Excel文件")
             return None, None, False, None
@@ -1483,19 +1532,34 @@ def create_plotly_chart_overlay(chart_config, data, original_indices=None):
     # 复制数据以避免修改原始数据
     data = data.copy()
     
+    # 是否使用索引作为X轴
+    use_index_as_x = chart_config.get('use_index_as_x', False)
+    
     # 智能检测X轴是否为时间戳，并转换为北京时间
     x_column = chart_config['x_column']
     ts_type = None
     x_tickformat = None
     x_hoverformat = ',.0f'  # 默认格式
+    x_axis_title = 'Index'  # 默认X轴标题
     
-    if x_column in data.columns:
+    if use_index_as_x:
+        # 使用索引作为X轴，不需要时间戳检测
+        x_axis_title = 'Index'
+    elif x_column in data.columns:
         ts_type = detect_timestamp_type(data[x_column])
         if ts_type:
             # 只有数值时间戳才需要转换为北京时间
-            if ts_type in ('10digit', '13digit'):
+            if ts_type in ('10digit', '10digit_ms', '13digit'):
                 data[x_column] = convert_timestamp_to_beijing_time(data[x_column], ts_type)
             x_tickformat, x_hoverformat = get_timestamp_format(ts_type)
+        x_axis_title = x_column + (' (北京时间)' if ts_type else '')
+    
+    # 按X轴排序（如果启用，且不使用索引作为X轴）
+    if not use_index_as_x and chart_config.get('sort_by_x', False) and x_column in data.columns:
+        sort_order = data[x_column].argsort()
+        data = data.iloc[sort_order].reset_index(drop=True)
+        if original_indices is not None:
+            original_indices = [original_indices[i] for i in sort_order]
     
     # 获取配置
     decimal_places = chart_config.get('decimal_places', 4)
@@ -1574,7 +1638,10 @@ def create_plotly_chart_overlay(chart_config, data, original_indices=None):
             yaxis_ref = f'y{idx + 1}'
         
         # 准备数据
-        x_data = data[chart_config['x_column']]
+        if use_index_as_x:
+            x_data = list(range(len(data)))
+        else:
+            x_data = data[chart_config['x_column']]
         y_data = data[y_col]
         
         # 检测数据类型
@@ -1675,7 +1742,7 @@ def create_plotly_chart_overlay(chart_config, data, original_indices=None):
     
     # 配置X轴
     xaxis_config = {
-        'title': {'text': chart_config['x_column'] + (' (北京时间)' if ts_type else '')},
+        'title': {'text': x_axis_title},
         'showgrid': chart_config.get('show_grid', True),
         'showline': True,
         'zeroline': True,
@@ -1804,19 +1871,34 @@ def create_plotly_chart(chart_config, data, original_indices=None):
     # 复制数据以避免修改原始数据
     data = data.copy()
     
+    # 是否使用索引作为X轴
+    use_index_as_x = chart_config.get('use_index_as_x', False)
+    
     # 智能检测X轴是否为时间戳，并转换为北京时间
     x_column = chart_config['x_column']
     ts_type = None
     x_tickformat = None
     x_hoverformat = ',.0f'  # 默认格式
+    x_axis_title = 'Index'  # 默认X轴标题
     
-    if x_column in data.columns:
+    if use_index_as_x:
+        # 使用索引作为X轴，不需要时间戳检测
+        x_axis_title = 'Index'
+    elif x_column in data.columns:
         ts_type = detect_timestamp_type(data[x_column])
         if ts_type:
             # 只有数值时间戳才需要转换为北京时间
-            if ts_type in ('10digit', '13digit'):
+            if ts_type in ('10digit', '10digit_ms', '13digit'):
                 data[x_column] = convert_timestamp_to_beijing_time(data[x_column], ts_type)
             x_tickformat, x_hoverformat = get_timestamp_format(ts_type)
+        x_axis_title = x_column + (' (北京时间)' if ts_type else '')
+    
+    # 按X轴排序（如果启用，且不使用索引作为X轴）
+    if not use_index_as_x and chart_config.get('sort_by_x', False) and x_column in data.columns:
+        sort_order = data[x_column].argsort()
+        data = data.iloc[sort_order].reset_index(drop=True)
+        if original_indices is not None:
+            original_indices = [original_indices[i] for i in sort_order]
     
     # 判断是否有双y轴
     y1_columns = chart_config.get('y1_columns', [])
@@ -1848,8 +1930,12 @@ def create_plotly_chart(chart_config, data, original_indices=None):
     for y_col in y1_columns:
         if y_col not in data.columns:
             continue
-            
-        x_data = data[chart_config['x_column']]
+        
+        # 根据配置获取X轴数据
+        if use_index_as_x:
+            x_data = list(range(len(data)))
+        else:
+            x_data = data[chart_config['x_column']]
         y_data = data[y_col]
         
         # 检测y数据类型，如果是字符串类型则不使用数值格式化
@@ -1893,8 +1979,12 @@ def create_plotly_chart(chart_config, data, original_indices=None):
     for y_col in y2_columns:
         if y_col not in data.columns:
             continue
-            
-        x_data = data[chart_config['x_column']]
+        
+        # 根据配置获取X轴数据
+        if use_index_as_x:
+            x_data = list(range(len(data)))
+        else:
+            x_data = data[chart_config['x_column']]
         y_data = data[y_col]
         
         # 检测y数据类型，如果是字符串类型则不使用数值格式化
@@ -1940,7 +2030,7 @@ def create_plotly_chart(chart_config, data, original_indices=None):
     # 设置布局
     xaxis_config = {
         'title': {
-            'text': chart_config['x_column'] + (' (北京时间)' if ts_type else '')
+            'text': x_axis_title
         },
         'showgrid': chart_config['show_grid'],
         'showline': True,
@@ -2407,6 +2497,7 @@ def add_new_chart(position=None):
         'chart_type': '折线图',
         'data_source': default_data_source,  # 数据来源文件名
         'x_column': default_x_column,
+        'use_index_as_x': False,  # 是否使用索引作为X轴
         'y1_columns': [],
         'y2_columns': [],
         'show_grid': True,
