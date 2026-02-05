@@ -5,8 +5,53 @@ from plotly.subplots import make_subplots
 import io
 import ast
 import numpy as np
+import re
 
 st.set_page_config(page_title="绘图小工具-by YMX", layout="wide")
+
+# ============ 图表标题生成辅助函数 ============
+
+def generate_chart_title(data_source, y_columns, x_column, chart_type='折线图'):
+    """
+    根据文件名、Y轴特征和X轴特征生成图表标题
+    
+    格式：文件名 - Y特征1, Y特征2, ... vs. X轴特征
+    如果是直方图，格式：文件名 - Y特征1, Y特征2, ... 分布
+    
+    Args:
+        data_source: 数据源文件名
+        y_columns: Y轴列名列表
+        x_column: X轴列名
+        chart_type: 图表类型
+    
+    Returns:
+        生成的标题字符串
+    """
+    # 获取文件名（去掉扩展名）
+    import os
+    filename = os.path.splitext(data_source)[0] if data_source else "未命名"
+    
+    # 处理Y轴特征名（限制最多显示3个，多了用省略号）
+    if not y_columns:
+        y_str = "未选择特征"
+    elif len(y_columns) <= 3:
+        y_str = ", ".join(y_columns)
+    else:
+        y_str = ", ".join(y_columns[:3]) + f" 等{len(y_columns)}个特征"
+    
+    # 根据图表类型生成不同格式的标题
+    if chart_type == '直方图':
+        return f"{filename} - {y_str} 分布"
+    else:
+        return f"{filename} - {y_str} vs. {x_column}"
+
+def is_default_title(title):
+    """检查标题是否为默认格式（图表 X）"""
+    return bool(re.match(r'^图表\s*\d+$', title.strip()))
+
+def is_auto_generated_title(title):
+    """检查标题是否为自动生成的格式（包含 ' vs. ' 或 ' 分布'）"""
+    return ' vs. ' in title or title.endswith(' 分布')
 
 # ============ 时间戳智能识别与转换 ============
 
@@ -427,6 +472,15 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
                 # 列名相同，保留之前的选择，只更新数据源
                 # 清理该图表的缓存状态（但保留列选择）
                 clear_chart_states(idx, preserve_column_selections=True)
+                
+                # 更新标题（如果是自动生成的格式或默认格式）
+                current_title = chart_config.get('title', '')
+                if is_default_title(current_title) or is_auto_generated_title(current_title):
+                    all_y_columns = chart_config.get('y1_columns', []) + chart_config.get('y2_columns', [])
+                    x_column = chart_config.get('x_column', '')
+                    chart_type = chart_config.get('chart_type', '折线图')
+                    chart_config['title'] = generate_chart_title(new_data_source, all_y_columns, x_column, chart_type)
+                
                 st.success(f"✅ 数据源已切换到 '{new_data_source}'，列名相同，已保留特征选择")
             else:
                 # 列名不同，重置所有列选择
@@ -441,6 +495,9 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
                 # 重置X轴为新数据源的第一列
                 if new_data_source and new_data_source in st.session_state.files_data:
                     chart_config['x_column'] = new_data.columns[0] if len(new_data.columns) > 0 else ''
+                
+                # 重置标题为默认格式（等用户重新选择特征后自动生成）
+                chart_config['title'] = f"图表 {idx + 1}"
                 
                 # 清理该图表的所有相关状态
                 clear_chart_states(idx)
@@ -759,6 +816,11 @@ def render_chart_properties_fragment(idx: int, chart_config: dict):
                 total_features = y1_total
                 if total_features > 10:
                     st.warning(f"⚠️ 当前选择了 {total_features} 个特征，建议不超过10个以保持图表清晰度。")
+            
+            # 如果标题是默认格式或自动生成格式，自动更新标题
+            all_y_columns = y1_column_names + y2_column_names
+            if is_default_title(new_title) or is_auto_generated_title(new_title):
+                new_title = generate_chart_title(data_source, all_y_columns, new_x_column, new_chart_type)
             
             # 更新图表配置
             st.session_state.charts[idx].update({
